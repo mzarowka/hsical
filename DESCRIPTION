@@ -2,10 +2,10 @@ Package: hsical
 Title: Hyperspectral Image Calibration Tool
 Version: 0.1.0
 Authors@R: 
-    person("Mateusz", "Zarowka", , email = "mateusz@example.com", role = c("aut", "cre"))
+    person("Maurycy", "Żarczyński", , email = "maurycy.zarczynski@ug.edu.pl", role = c("aut", "cre"))
 Description: A Shiny application for calculating pixel resolution from 
     hyperspectral test scans. Determines length and field-of-view resolution 
-    in micrometers per pixel and checks for square pixel geometry.
+    in micrometers per pixel and checks for square pixel geometry. Drafted and tested entire pipeline personally. Executed with Claude.
 License: MIT + file LICENSE
 Encoding: UTF-8
 Roxygen: list(markdown = TRUE)
