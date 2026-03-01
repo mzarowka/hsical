@@ -6,8 +6,10 @@ library(shiny)
 library(bslib)
 library(bsicons)
 library(shinyFiles)
+library(shinyjs)
 library(terra)
 library(measurements)
+library(purrr)
 library(yaml)
 library(jsonlite)
 
@@ -22,27 +24,30 @@ get_config_dir <- function() {
 }
 
 load_material_types <- function() {
-  f <- file.path(get_config_dir(), "material_types.json")
+  f        <- file.path(get_config_dir(), "material_types.json")
   defaults <- c("lake sediments", "marine sediments", "peat", "soil",
                 "rock", "outcrop", "other")
   if (file.exists(f)) {
-    tryCatch(unique(c(fromJSON(f), defaults)), error = \(e) defaults)
+    tryCatch(unique(c(jsonlite::fromJSON(f), defaults)), error = \(e) defaults)
   } else {
     defaults
   }
 }
 
 save_material_types <- function(types) {
-  write_json(types, file.path(get_config_dir(), "material_types.json"),
-             auto_unbox = TRUE)
+  jsonlite::write_json(
+    types,
+    file.path(get_config_dir(), "material_types.json"),
+    auto_unbox = TRUE
+  )
 }
 
 # Tooltip label: short label + info icon
 tip <- function(label, text) {
   tagList(
     label,
-    tooltip(
-      bs_icon("info-circle", size = "0.85em", class = "text-muted ms-1"),
+    bslib::tooltip(
+      bsicons::bs_icon("info-circle", size = "0.85em", class = "text-muted ms-1"),
       text,
       placement = "right"
     )
@@ -53,8 +58,7 @@ tip <- function(label, text) {
 parse_hdr <- function(hdr_path) {
   if (!file.exists(hdr_path)) return(NULL)
 
-  raw   <- readLines(hdr_path, warn = FALSE)
-  content <- paste(raw, collapse = "\n")
+  content <- readLines(hdr_path, warn = FALSE) |> paste(collapse = "\n")
 
   xval <- function(pattern) {
     m <- regmatches(content, regexpr(pattern, content, perl = TRUE))
@@ -67,20 +71,26 @@ parse_hdr <- function(hdr_path) {
   }
 
   # binning = {spectral, spatial}
-  bin_m <- regmatches(content,
-    regexpr("(?<=binning = \\{)[0-9]+, [0-9]+(?=\\})", content, perl = TRUE))
+  bin_m <- regmatches(
+    content,
+    regexpr("(?<=binning = \\{)[0-9]+, [0-9]+(?=\\})", content, perl = TRUE)
+  )
   if (length(bin_m) > 0 && bin_m != "") {
-    b <- as.numeric(strsplit(bin_m, ", ")[[1]])
-    spec_bin <- b[1]; spat_bin <- b[2]
+    b        <- as.numeric(strsplit(bin_m, ", ")[[1]])
+    spec_bin <- b[1]
+    spat_bin <- b[2]
   } else {
-    spec_bin <- NA_real_; spat_bin <- NA_real_
+    spec_bin <- NA_real_
+    spat_bin <- NA_real_
   }
 
   # Camera from sensor type line
   sensor_raw <- xval("(?<=sensor type = )[^\n]+")
   camera <- if (!is.na(sensor_raw)) {
     if (grepl("SWIR", sensor_raw, ignore.case = TRUE)) "SWIR" else "VNIR"
-  } else NA_character_
+  } else {
+    NA_character_
+  }
 
   # Calibration pack path
   cal_raw <- xval("(?<=calibration pack = )[^\n]+")
@@ -107,7 +117,7 @@ parse_log <- function(log_path) {
   if (!file.exists(log_path))
     return(list(dropped = NA_real_, recorded = NA_real_))
 
-  content <- paste(readLines(log_path, warn = FALSE), collapse = "\n")
+  content <- readLines(log_path, warn = FALSE) |> paste(collapse = "\n")
 
   dropped  <- regmatches(content,
     regexpr("(?<=incidents, )[0-9]+(?= dropped frames)", content, perl = TRUE))
@@ -122,18 +132,66 @@ parse_log <- function(log_path) {
 
 # Three-tier aspect ratio classification
 ratio_tier <- function(ratio) {
-  if (is.na(ratio))                          return(list(theme = "secondary", icon = "square",        label = "—"))
-  if (ratio >= 0.95 && ratio <= 1.05)        return(list(theme = "success",   icon = "check-square",  label = "✓ Square pixels"))
-  if (ratio >= 0.90 && ratio <= 1.10)        return(list(theme = "warning",   icon = "exclamation-square", label = "⚠ Nearly square — check"))
-  return(                                           list(theme = "danger",    icon = "x-square",      label = "✗ Not square — adjust FOV"))
+  if (is.na(ratio))                   return(list(theme = "secondary", icon = "square",             label = "—"))
+  if (ratio >= 0.95 && ratio <= 1.05) return(list(theme = "success",   icon = "check-square",       label = "✓ Square pixels"))
+  if (ratio >= 0.90 && ratio <= 1.10) return(list(theme = "warning",   icon = "exclamation-square", label = "⚠ Nearly square — check"))
+                                      return(list(theme = "danger",    icon = "x-square",           label = "✗ Not square — adjust FOV"))
 }
 
-# YAML export schema
+# --------------------------------------------------------------------------
+# Validation
+# --------------------------------------------------------------------------
+
+# Expected session ID format: YYYY-MM-DD-CAMERA_NN (e.g. 2026-03-15-VNIR_01)
+SESSION_ID_REGEX <- "^\\d{4}-\\d{2}-\\d{2}-(VNIR|SWIR)_\\d{2}$"
+
+is_valid_session_id <- function(id) {
+  nzchar(trimws(id)) && grepl(SESSION_ID_REGEX, trimws(id))
+}
+
+# Mandatory fields and their display labels
+MANDATORY_FIELDS <- list(
+  session_id       = "Session ID",
+  operator         = "Operator",
+  campaign_prefix  = "Campaign prefix",
+  dataset_name     = "Dataset name",
+  lens             = "Lens",
+  calibration_pack = "Calibration pack",
+  et_target        = "ET_target (ms)",
+  et_white         = "ET_white (ms)",
+  fov              = "FOV (mm)",
+  spectral_binning = "Spectral binning",
+  spatial_binning  = "Spatial binning",
+  target_start     = "Target start (mm)",
+  target_stop      = "Target stop (mm)",
+  test_scan_start  = "Test scan start (mm)",
+  test_scan_stop   = "Test scan stop (mm)",
+  aspect_ratio     = "Aspect ratio"
+)
+
+is_blank <- function(val) {
+  is.null(val) ||
+    (is.character(val) && nchar(trimws(val)) == 0) ||
+    (length(val) == 1 && is.na(val))
+}
+
+validate_form <- function(d) {
+  missing_fields <- names(MANDATORY_FIELDS) |>
+    purrr::keep(\(field) is_blank(d[[field]])) |>
+    purrr::map_chr(\(field) MANDATORY_FIELDS[[field]])
+
+  list(ok = length(missing_fields) == 0, fields = missing_fields)
+}
+
+# --------------------------------------------------------------------------
+# Export helpers
+# --------------------------------------------------------------------------
+
 generate_yaml <- function(d) {
-  scan_len <- if (!is.na(d$target_start) && !is.na(d$target_stop))
+  scan_len <- if (!is_blank(d$target_start) && !is_blank(d$target_stop))
     d$target_stop - d$target_start else NA
 
-  as.yaml(list(
+  yaml::as.yaml(list(
     session = list(
       session_id      = d$session_id,
       operator        = d$operator,
@@ -142,14 +200,14 @@ generate_yaml <- function(d) {
       dataset_name    = d$dataset_name
     ),
     instrument = list(
-      camera            = d$camera,
-      lens              = d$lens,
-      calibration_pack  = d$calibration_pack,
-      fov_mm            = d$fov,
-      et_target_ms      = d$et_target,
-      et_white_ms       = d$et_white,
-      spectral_binning  = d$spectral_binning,
-      spatial_binning   = d$spatial_binning
+      camera           = d$camera,
+      lens             = d$lens,
+      calibration_pack = d$calibration_pack,
+      fov_mm           = d$fov,
+      et_target_ms     = d$et_target,
+      et_white_ms      = d$et_white,
+      spectral_binning = d$spectral_binning,
+      spatial_binning  = d$spatial_binning
     ),
     geometry = list(
       target_start_mm       = d$target_start,
@@ -160,11 +218,11 @@ generate_yaml <- function(d) {
       measured_aspect_ratio = d$aspect_ratio
     ),
     scan = list(
-      filename              = d$filename,
-      total_lines           = d$total_lines,
-      dropped_frames        = d$dropped_frames,
-      saturation_ratio_pct  = d$saturation_ratio,
-      gcp_pins              = d$gcp_pins
+      filename             = d$filename,
+      total_lines          = d$total_lines,
+      dropped_frames       = d$dropped_frames,
+      saturation_ratio_pct = d$saturation_ratio,
+      gcp_pins             = d$gcp_pins
     ),
     sample = list(
       core_id        = d$core_id,
@@ -181,9 +239,8 @@ generate_yaml <- function(d) {
   ))
 }
 
-# CSV row for master log
 generate_csv_row <- function(d) {
-  scan_len <- if (!is.na(d$target_start) && !is.na(d$target_stop))
+  scan_len <- if (!is_blank(d$target_start) && !is_blank(d$target_stop))
     d$target_stop - d$target_start else NA
 
   data.frame(
@@ -229,9 +286,11 @@ generate_csv_row <- function(d) {
 # ============================================================================
 
 ui <- page_sidebar(
-  title   = "HSI Calibration Tool",
-  theme   = bs_theme(version = 5, bootswatch = "flatly", "navbar-bg" = "#2C3E50"),
+  title    = "HSI Calibration Tool",
+  theme    = bs_theme(version = 5, bootswatch = "flatly", "navbar-bg" = "#2C3E50"),
   fillable = FALSE,
+
+  useShinyjs(),
 
   sidebar = sidebar(
     width = 310,
@@ -299,7 +358,7 @@ ui <- page_sidebar(
       verbatimTextOutput("core_log_path", placeholder = TRUE),
 
       actionButton("load_core", "Load core metadata",
-                   icon = icon("download"),
+                   icon  = icon("download"),
                    class = "btn-primary w-100 mb-2"),
 
       hr(),
@@ -313,8 +372,18 @@ ui <- page_sidebar(
       verbatimTextOutput("white_hdr_path", placeholder = TRUE),
 
       actionButton("load_white", "Load ET_white",
-                   icon = icon("download"),
+                   icon  = icon("download"),
                    class = "btn-outline-primary w-100 mb-2"),
+
+      hr(),
+
+      h6("Session"),
+      actionButton("toggle_lock", "Lock session",
+                   icon  = icon("lock"),
+                   class = "btn-warning w-100 mb-1"),
+      actionButton("clear_scan", "New scan entry",
+                   icon  = icon("rotate"),
+                   class = "btn-outline-secondary w-100 mb-2"),
 
       hr(),
 
@@ -489,9 +558,11 @@ ui <- page_sidebar(
             textInput("session_id",
               tip("Session ID",
                 "Groups all scans sharing the same camera, lens, FOV, ET_target,
-                 and binning. Closes when any parameter changes or after the white
-                 reference scan. Suggested format: SITE-YY-S1, e.g. LAZ-26-S1."),
-              placeholder = "LAZ-26-S1"),
+                 and binning. Format: YYYY-MM-DD-CAMERA_NN, e.g.
+                 2026-03-15-VNIR_01. Increment NN when a new session starts on
+                 the same day with the same sensor. Lock the session after the
+                 first scan to prevent accidental changes."),
+              placeholder = "2026-03-15-VNIR_01"),
 
             textInput("operator",
               tip("Operator", "Full first and last name of the person operating the scanner."),
@@ -626,64 +697,63 @@ ui <- page_sidebar(
               tip("Section depth (cm)",
                 "Depth range of this core section in centimetres, e.g. 0-50."),
               placeholder = "0-50"),
-            selectizeInput("material_type", "Material type",
+            selectizeInput("material_type",
+              "Material type",
               choices = NULL,
-              options = list(create = TRUE,
-                             placeholder = "Select or add a new type...")),
-            textInput("material_owner", "Material owner",
-              placeholder = "Institution / PI")
+              options = list(create = TRUE, placeholder = "Select or type...")),
+            textInput("material_owner",
+              tip("Material owner",
+                "Institution or person responsible for the material."),
+              placeholder = "University of Gdańsk")
           )
         ),
 
         card(
           card_header("Location", class = "bg-info text-white"),
           card_body(
-            textInput("site_name", "Site name", placeholder = "Lake Łazek"),
+            textInput("site_name", "Site name", placeholder = "Łazy"),
             textInput("site_code",
               tip("Site code",
-                "Short alphanumeric code used in file names and identifiers,
-                 matching the SITE part of the campaign prefix. Example: LAZ."),
-              placeholder = "LAZ"),
+                "Short code used as the campaign prefix root, e.g. LAZ for Łazy."),
+              placeholder = "LAZ24"),
             textInput("country", "Country", placeholder = "Poland")
           )
         ),
 
         card(
-          card_header("Results & QC", class = "bg-success text-white"),
+          card_header("Results & QC", class = "bg-warning text-dark"),
           card_body(
             numericInput("log_aspect_ratio",
-              tip("Measured aspect ratio",
-                "From Tab 1, after the geometry confirmation scan. Target range
-                 is 0.95–1.05 for acceptably square pixels."),
-              value = NULL, step = 0.001),
+              tip("Aspect ratio",
+                "Measured aspect ratio from Tab 1, after the confirmation test
+                 scan. Copy the value here for logging."),
+              value = NULL, min = 0, step = 0.001),
 
             numericInput("log_total_lines",
               tip("Total scan lines",
-                "Number of recorded frames (lines) in the scan. Auto-filled
-                 from the core .hdr file (lines field)."),
-              value = NULL),
+                "Number of scan lines in the core scan. Auto-filled from .hdr."),
+              value = NULL, min = 0),
 
             numericInput("log_dropped_frames",
               tip("Dropped frames",
-                "From the core .log file. Any value > 0 should be noted;
-                 large numbers indicate a scanning problem requiring re-scan.
-                 Auto-filled from .log."),
-              value = NULL),
+                "Number of dropped frames from the .log file. Auto-filled
+                 from .log. Any dropped frames invalidate affected scan lines."),
+              value = NULL, min = 0),
 
             numericInput("saturation_ratio",
               tip("Saturation ratio (%)",
                 "Fraction of core-area pixel positions where any single band
-                 equals the detector ceiling DN. Calculated in R post-processing
-                 (HSItools). Threshold: 0.1% — if exceeded, reduce ET_target
-                 and re-scan. Saturated pixels are masked during reflectance
-                 calculation."),
+                 equals the detector ceiling DN. Calculated in HSItools post-
+                 processing. Threshold: 0.1% — if exceeded, reduce ET_target
+                 and re-scan."),
               value = NULL, min = 0, max = 100, step = 0.01),
 
             numericInput("gcp_pins",
               tip("GCP pins",
-                "Number of steel pins placed in the sediment surface for
-                 VNIR–SWIR image co-registration. Minimum 10 per section,
-                 alternating left–right, ~10 cm apart, within the SWIR FOV."),
+                "Number of steel pins placed in the sediment for VNIR–SWIR
+                 co-registration. Required whenever co-registration is planned.
+                 Both the VNIR and SWIR log entries for the same section must
+                 record the same pin count."),
               value = NULL, min = 0)
           )
         )
@@ -720,13 +790,13 @@ ui <- page_sidebar(
           layout_columns(
             col_widths = c(4, 4, 4),
             actionButton("save_individual", "Save YAML",
-              icon = icon("file-export"),
+              icon  = icon("file-export"),
               class = "btn-outline-primary w-100"),
             actionButton("save_master", "Append to master CSV",
-              icon = icon("database"),
+              icon  = icon("database"),
               class = "btn-outline-success w-100"),
             actionButton("save_both", "Save Both",
-              icon = icon("floppy-disk"),
+              icon  = icon("floppy-disk"),
               class = "btn-primary w-100")
           )
         )
@@ -744,14 +814,13 @@ server <- function(input, output, session) {
   volumes <- getVolumes()()
 
   # File choosers — Tabs 1 & 2
-  shinyFileChoose(input, "file_select", roots = volumes,
-                  filetypes = c("raw", "tif", "tiff"))
+  shinyFileChoose(input, "file_select",       roots = volumes, filetypes = c("raw", "tif", "tiff"))
 
-  # File choosers — Tab 3 (separate)
-  shinyFileChoose(input, "core_hdr_select",  roots = volumes, filetypes = "hdr")
-  shinyFileChoose(input, "core_log_select",  roots = volumes, filetypes = "log")
-  shinyFileChoose(input, "white_hdr_select", roots = volumes, filetypes = "hdr")
-  shinyDirChoose(input, "save_dir", roots = volumes)
+  # File choosers — Tab 3
+  shinyFileChoose(input, "core_hdr_select",   roots = volumes, filetypes = "hdr")
+  shinyFileChoose(input, "core_log_select",   roots = volumes, filetypes = "log")
+  shinyFileChoose(input, "white_hdr_select",  roots = volumes, filetypes = "hdr")
+  shinyDirChoose(input,  "save_dir",          roots = volumes)
 
   # Material types (persisted in ~/.hsical)
   material_types <- reactiveVal(load_material_types())
@@ -771,10 +840,84 @@ server <- function(input, output, session) {
   })
 
   # --------------------------------------------------------------------------
-  # Tabs 1 & 2 — shared reactives
+  # Session locking
   # --------------------------------------------------------------------------
 
-  selected_path <- reactive({
+  session_locked <- reactiveVal(FALSE)
+
+  # Instrument fields that are constant for the duration of a session
+  SESSION_FIELDS <- c(
+    "session_id", "operator", "camera", "lens", "calibration_pack",
+    "et_target", "et_white", "log_fov", "spectral_binning", "spatial_binning"
+  )
+
+  # Scan-specific fields cleared between entries within the same session
+  SCAN_TEXT_FIELDS <- c(
+    "campaign_prefix", "dataset_name", "log_filename", "core_id",
+    "section_depth", "material_owner", "site_name", "site_code",
+    "country", "notes"
+  )
+  SCAN_NUMERIC_FIELDS <- c(
+    "log_total_lines", "log_dropped_frames",
+    "target_start", "target_stop",
+    "test_scan_start", "test_scan_stop",
+    "log_aspect_ratio", "saturation_ratio", "gcp_pins"
+  )
+
+  observeEvent(input$toggle_lock, {
+    locked <- !session_locked()
+    session_locked(locked)
+
+    if (locked) {
+      purrr::walk(SESSION_FIELDS, shinyjs::disable)
+      updateActionButton(session, "toggle_lock",
+                         label = "Unlock session",
+                         icon  = icon("lock-open"))
+      showNotification(
+        "Session locked. Instrument fields are now read-only for this session.",
+        type = "message"
+      )
+    } else {
+      purrr::walk(SESSION_FIELDS, shinyjs::enable)
+      updateActionButton(session, "toggle_lock",
+                         label = "Lock session",
+                         icon  = icon("lock"))
+      showNotification("Session unlocked.", type = "message")
+    }
+  })
+
+  observeEvent(input$clear_scan, {
+    purrr::walk(
+      SCAN_TEXT_FIELDS,
+      \(f) updateTextInput(session, f, value = "")
+    )
+    purrr::walk(
+      SCAN_NUMERIC_FIELDS,
+      \(f) updateNumericInput(session, f, value = NA)
+    )
+    updateSelectizeInput(session, "material_type", selected = "")
+    updateDateInput(session, "scan_date", value = Sys.Date())
+    showNotification("Scan fields cleared. Ready for next entry.", type = "message")
+  })
+
+  # --------------------------------------------------------------------------
+  # Session ID pre-fill hint
+  # Pre-fills only when the field is empty — never overwrites operator input.
+  # --------------------------------------------------------------------------
+
+  observe({
+    req(input$scan_date, input$camera)
+    if (!session_locked() && nchar(trimws(input$session_id %||% "")) == 0) {
+      stem <- paste0(format(input$scan_date, "%Y-%m-%d"), "-", input$camera, "_01")
+      updateTextInput(session, "session_id", value = stem)
+    }
+  })
+
+  # --------------------------------------------------------------------------
+  # Tabs 1 & 2 — raster loading
+  # --------------------------------------------------------------------------
+
+  raster_path <- reactive({
     req(input$file_select)
     fi <- parseFilePaths(volumes, input$file_select)
     if (nrow(fi) == 0) return(NULL)
@@ -782,63 +925,35 @@ server <- function(input, output, session) {
   })
 
   output$file_path <- renderText({
-    if (is.null(selected_path())) "No file selected" else basename(selected_path())
+    if (is.null(raster_path())) "No file selected" else basename(raster_path())
   })
 
   raster_data <- reactive({
-    req(selected_path())
-    tryCatch(
-      terra::rast(selected_path()),
-      error = \(e) {
-        showNotification(paste("Cannot read raster:", e$message), type = "error")
-        NULL
-      }
-    )
+    req(raster_path())
+    tryCatch(terra::rast(raster_path()), error = \(e) NULL)
   })
 
-  # Scan length derived from motor positions, always in mm then converted
-  scan_len_mm <- reactive({
-    req(input$motor_start, input$motor_stop)
-    len <- input$motor_stop - input$motor_start
-    req(len > 0)
-    len
-  })
+  # --------------------------------------------------------------------------
+  # Tab 1 — calculations
+  # --------------------------------------------------------------------------
 
-  scan_len_um <- reactive({
-    req(scan_len_mm())
-    conv_unit(scan_len_mm(), "mm", "um")
-  })
-
-  # Along-track pixel size
-  true_pixel_res <- reactive({
-    req(raster_data(), scan_len_um())
-    scan_len_um() / nrow(raster_data())
-  })
-
-  # Tab 1 calculations
   check_calculations <- reactive({
-    req(raster_data(), scan_len_um(), input$scan_fov, input$scan_fov > 0)
-    r       <- raster_data()
-    fov_um  <- conv_unit(input$scan_fov, "mm", "um")
-    res_len <- scan_len_um() / nrow(r)
-    res_fov <- fov_um / ncol(r)
+    r     <- raster_data()
+    start <- input$motor_start
+    stop  <- input$motor_stop
+    fov   <- input$scan_fov
+
+    req(r, start, stop, fov)
+    if (stop <= start) return(NULL)
+
+    scan_len_um <- measurements::conv_unit(stop - start, "mm", "um")
+    fov_um      <- measurements::conv_unit(fov,          "mm", "um")
+
+    res_len <- scan_len_um / nrow(r)
+    res_fov <- fov_um      / ncol(r)
+
     list(res_len = res_len, res_fov = res_fov, ratio = res_len / res_fov)
   })
-
-  # Tab 2 ideal FOV
-  ideal_fov <- reactive({
-    req(raster_data(), true_pixel_res())
-    fov_um <- true_pixel_res() * ncol(raster_data())
-    list(
-      um = fov_um,
-      mm = conv_unit(fov_um, "um", "mm"),
-      cm = conv_unit(fov_um, "um", "cm")
-    )
-  })
-
-  # --------------------------------------------------------------------------
-  # Tab 1 outputs
-  # --------------------------------------------------------------------------
 
   output$check_n_rows <- renderText({
     r <- raster_data()
@@ -874,8 +989,33 @@ server <- function(input, output, session) {
   })
 
   # --------------------------------------------------------------------------
-  # Tab 2 outputs
+  # Tab 2 — calculations
   # --------------------------------------------------------------------------
+
+  true_pixel_res <- reactive({
+    r     <- raster_data()
+    start <- input$motor_start
+    stop  <- input$motor_stop
+
+    req(r, start, stop)
+    if (stop <= start) return(NULL)
+
+    measurements::conv_unit(stop - start, "mm", "um") / nrow(r)
+  })
+
+  ideal_fov <- reactive({
+    res <- true_pixel_res()
+    r   <- raster_data()
+
+    req(res, r)
+    fov_um <- res * ncol(r)
+
+    list(
+      um = fov_um,
+      mm = measurements::conv_unit(fov_um, "um", "mm"),
+      cm = measurements::conv_unit(fov_um, "um", "cm")
+    )
+  })
 
   output$calc_n_rows <- renderText({
     r <- raster_data()
@@ -958,38 +1098,45 @@ server <- function(input, output, session) {
 
   observeEvent(input$load_core, {
     req(core_hdr_path())
-
     hdr <- parse_hdr(core_hdr_path())
 
     if (!is.null(hdr)) {
-      if (!is.na(hdr$camera))            updateSelectInput(session,  "camera",            value = hdr$camera)
-      if (!is.na(hdr$tint))              updateNumericInput(session, "et_target",          value = round(hdr$tint, 3))
-      if (!is.na(hdr$spectral_binning))  updateNumericInput(session, "spectral_binning",   value = hdr$spectral_binning)
-      if (!is.na(hdr$spatial_binning))   updateNumericInput(session, "spatial_binning",    value = hdr$spatial_binning)
-      if (!is.na(hdr$calibration_pack))  updateTextInput(session,    "calibration_pack",   value = hdr$calibration_pack)
-      if (!is.na(hdr$acquisition_date))  updateDateInput(session,    "scan_date",          value = as.Date(hdr$acquisition_date))
-      if (!is.na(hdr$lines))             updateNumericInput(session, "log_total_lines",    value = hdr$lines)
+      # Instrument fields: respect session lock
+      if (!session_locked()) {
+        if (!is.na(hdr$camera))           updateSelectInput(session,  "camera",            value = hdr$camera)
+        if (!is.na(hdr$tint))             updateNumericInput(session, "et_target",          value = round(hdr$tint, 3))
+        if (!is.na(hdr$spectral_binning)) updateNumericInput(session, "spectral_binning",   value = hdr$spectral_binning)
+        if (!is.na(hdr$spatial_binning))  updateNumericInput(session, "spatial_binning",    value = hdr$spatial_binning)
+        if (!is.na(hdr$calibration_pack)) updateTextInput(session,    "calibration_pack",   value = hdr$calibration_pack)
+      }
+
+      # Scan-level fields: always update
+      if (!is.na(hdr$acquisition_date)) updateDateInput(session,    "scan_date",         value = as.Date(hdr$acquisition_date))
+      if (!is.na(hdr$lines))            updateNumericInput(session, "log_total_lines",   value = hdr$lines)
       updateTextInput(session, "log_filename", value = basename(core_hdr_path()))
     }
 
     # Load dropped frames from .log if already selected
     if (!is.null(core_log_path())) {
       log_data <- parse_log(core_log_path())
-      if (!is.na(log_data$dropped)) {
+      if (!is.na(log_data$dropped))
         updateNumericInput(session, "log_dropped_frames", value = log_data$dropped)
-      }
     }
 
-    showNotification("Core metadata loaded from .hdr", type = "message")
+    msg <- if (session_locked())
+      "Core metadata loaded (instrument fields skipped — session is locked)."
+    else
+      "Core metadata loaded from .hdr."
+
+    showNotification(msg, type = "message")
   })
 
   # Load .log separately if selected after core was already loaded
   observeEvent(input$core_log_select, {
     req(core_log_path())
     log_data <- parse_log(core_log_path())
-    if (!is.na(log_data$dropped)) {
+    if (!is.na(log_data$dropped))
       updateNumericInput(session, "log_dropped_frames", value = log_data$dropped)
-    }
   })
 
   # --------------------------------------------------------------------------
@@ -998,12 +1145,53 @@ server <- function(input, output, session) {
 
   observeEvent(input$load_white, {
     req(white_hdr_path())
-    hdr <- parse_hdr(white_hdr_path())
-    if (!is.null(hdr) && !is.na(hdr$tint)) {
-      updateNumericInput(session, "et_white", value = round(hdr$tint, 3))
-      showNotification("ET_white loaded from white reference .hdr", type = "message")
-    } else {
+    white_hdr <- parse_hdr(white_hdr_path())
+
+    if (is.null(white_hdr) || is.na(white_hdr$tint)) {
       showNotification("Could not read tint from white reference .hdr", type = "warning")
+      return()
+    }
+
+    # ET_white is a session-level field; respect session lock
+    if (!session_locked())
+      updateNumericInput(session, "et_white", value = round(white_hdr$tint, 3))
+
+    showNotification("ET_white loaded from white reference .hdr", type = "message")
+
+    # Sanity check: camera and binning must match the core scan .hdr.
+    # Mismatches warn but never block — the operator is the authority.
+    core_camera   <- input$camera
+    core_spec_bin <- input$spectral_binning
+    core_spat_bin <- input$spatial_binning
+
+    if (!is.na(white_hdr$camera) &&
+        nzchar(core_camera) &&
+        !identical(white_hdr$camera, core_camera)) {
+      showNotification(
+        paste0("Camera mismatch: core is ", core_camera,
+               " but white ref reports ", white_hdr$camera, "."),
+        type = "warning", duration = 10
+      )
+    }
+
+    if (!is.na(white_hdr$spectral_binning) &&
+        !is.na(core_spec_bin) &&
+        !isTRUE(all.equal(white_hdr$spectral_binning, core_spec_bin))) {
+      showNotification(
+        paste0("Spectral binning mismatch: core is ", core_spec_bin,
+               " but white ref reports ", white_hdr$spectral_binning, "."),
+        type = "warning", duration = 10
+      )
+    }
+
+    if (!is.na(white_hdr$spatial_binning) &&
+        !is.na(core_spat_bin) &&
+        !isTRUE(all.equal(white_hdr$spatial_binning, core_spat_bin))) {
+      showNotification(
+        paste0("Spatial binning mismatch: core is ", core_spat_bin,
+               " but white ref reports ", white_hdr$spatial_binning, "."),
+        type = "warning", duration = 10
+      )
     }
   })
 
@@ -1048,33 +1236,70 @@ server <- function(input, output, session) {
   })
 
   # --------------------------------------------------------------------------
+  # Tab 3 — validation
+  # --------------------------------------------------------------------------
+
+  run_validation <- function(d) {
+    result <- validate_form(d)
+
+    if (!result$ok) {
+      showNotification(
+        paste0("Missing required fields: ", paste(result$fields, collapse = ", "), "."),
+        type     = "error",
+        duration = 12
+      )
+    }
+
+    # Session ID format: soft warning, does not block save
+    if (nzchar(trimws(d$session_id)) && !is_valid_session_id(d$session_id)) {
+      showNotification(
+        paste0(
+          "Session ID '", d$session_id, "' does not match the expected format ",
+          "YYYY-MM-DD-CAMERA_NN (e.g. 2026-03-15-VNIR_01). Saving anyway."
+        ),
+        type     = "warning",
+        duration = 10
+      )
+    }
+
+    result$ok
+  }
+
+  # --------------------------------------------------------------------------
   # Tab 3 — save functions
   # --------------------------------------------------------------------------
 
   save_yaml <- function() {
+    d <- collect_form_data()
+    if (!run_validation(d)) return(invisible(FALSE))
+
     dir <- selected_save_dir()
     if (is.null(dir)) {
-      showNotification("Please select a save folder first", type = "error")
-      return(FALSE)
+      showNotification("Please select a save folder first.", type = "error")
+      return(invisible(FALSE))
     }
-    d    <- collect_form_data()
-    base <- if (d$filename != "") tools::file_path_sans_ext(d$filename)
+
+    base <- if (nzchar(d$filename)) tools::file_path_sans_ext(d$filename)
             else format(Sys.time(), "%Y%m%d_%H%M%S")
     out  <- file.path(dir, paste0(base, "_scanlog.yaml"))
+
     tryCatch({
       writeLines(generate_yaml(d), out)
       showNotification(paste("Saved:", basename(out)), type = "message")
-      TRUE
+      invisible(TRUE)
     }, error = \(e) {
       showNotification(paste("Error saving YAML:", e$message), type = "error")
-      FALSE
+      invisible(FALSE)
     })
   }
 
   save_csv <- function() {
-    d      <- collect_form_data()
+    d <- collect_form_data()
+    if (!run_validation(d)) return(invisible(FALSE))
+
     master <- file.path(getwd(), "hsical_master_log.csv")
     row    <- generate_csv_row(d)
+
     tryCatch({
       if (file.exists(master)) {
         write.table(row, master, append = TRUE, sep = ",",
@@ -1083,10 +1308,10 @@ server <- function(input, output, session) {
         write.csv(row, master, row.names = FALSE, quote = TRUE)
       }
       showNotification(paste("Appended to:", master), type = "message")
-      TRUE
+      invisible(TRUE)
     }, error = \(e) {
       showNotification(paste("Error saving CSV:", e$message), type = "error")
-      FALSE
+      invisible(FALSE)
     })
   }
 
