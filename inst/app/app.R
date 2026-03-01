@@ -1,203 +1,226 @@
-# HSI Calibration Tool v0.3.0
-# Tab 1: Check calibration
-# Tab 2: Calculate ideal FOV
-# Tab 3: Scan Log
+# HSI Calibration Tool v1.0.0
+# Protocol v2.0 — Department of Geomorphology and Quaternary Geology, UG
+# Tabs: (1) Check pixel aspect ratio  (2) Calculate ideal FOV  (3) Scan Log
 
 library(shiny)
 library(bslib)
+library(bsicons)
 library(shinyFiles)
 library(terra)
 library(measurements)
 library(yaml)
 library(jsonlite)
-library(countrycode)
 
 # ============================================================================
-# Helper Functions
+# Helpers
 # ============================================================================
 
-# Get config directory path
 get_config_dir <- function() {
-  config_dir <- file.path(path.expand("~"), ".hsical")
-  if (!dir.exists(config_dir)) dir.create(config_dir, recursive = TRUE)
-  config_dir
+  d <- file.path(path.expand("~"), ".hsical")
+  if (!dir.exists(d)) dir.create(d, recursive = TRUE)
+  d
 }
 
-# Load material types from config
 load_material_types <- function() {
-  config_file <- file.path(get_config_dir(), "material_types.json")
-  defaults <- c(
-    "lake sediments", "marine sediments", "peat", "soil",
-    "rock", "outcrop", "other"
-  )
-  
-  if (file.exists(config_file)) {
-    tryCatch({
-      saved <- fromJSON(config_file)
-      unique(c(saved, defaults))
-    }, error = \(e) defaults)
+  f <- file.path(get_config_dir(), "material_types.json")
+  defaults <- c("lake sediments", "marine sediments", "peat", "soil",
+                "rock", "outcrop", "other")
+  if (file.exists(f)) {
+    tryCatch(unique(c(fromJSON(f), defaults)), error = \(e) defaults)
   } else {
     defaults
   }
 }
 
-# Save material types to config
 save_material_types <- function(types) {
-  config_file <- file.path(get_config_dir(), "material_types.json")
-  write_json(types, config_file, auto_unbox = TRUE)
+  write_json(types, file.path(get_config_dir(), "material_types.json"),
+             auto_unbox = TRUE)
+}
+
+# Tooltip label: short label + info icon
+tip <- function(label, text) {
+  tagList(
+    label,
+    tooltip(
+      bs_icon("info-circle", size = "0.85em", class = "text-muted ms-1"),
+      text,
+      placement = "right"
+    )
+  )
 }
 
 # Parse ENVI .hdr file
 parse_hdr <- function(hdr_path) {
   if (!file.exists(hdr_path)) return(NULL)
-  
-  lines <- readLines(hdr_path, warn = FALSE)
-  content <- paste(lines, collapse = "\n")
-  
-  extract_value <- function(pattern) {
-    match <- regmatches(content, regexpr(pattern, content, perl = TRUE))
-    if (length(match) == 0 || match == "") return(NA)
-    match
+
+  raw   <- readLines(hdr_path, warn = FALSE)
+  content <- paste(raw, collapse = "\n")
+
+  xval <- function(pattern) {
+    m <- regmatches(content, regexpr(pattern, content, perl = TRUE))
+    if (length(m) == 0 || identical(m, character(0)) || m == "") NA_character_ else m
   }
-  
-  extract_numeric <- function(key) {
-    pattern <- paste0("(?<=", key, " = )[0-9.]+")
-    val <- extract_value(pattern)
-    if (is.na(val)) return(NA)
-    as.numeric(val)
+
+  xnum <- function(key) {
+    v <- xval(paste0("(?<=", key, " = )[0-9.]+"))
+    if (is.na(v)) NA_real_ else as.numeric(v)
   }
-  
-  binning_match <- regmatches(content, regexpr("(?<=binning = \\{)[0-9]+, [0-9]+(?=\\})", content, perl = TRUE))
-  if (length(binning_match) > 0 && binning_match != "") {
-    binning <- as.numeric(strsplit(binning_match, ", ")[[1]])
-    spectral_bin <- binning[1]
-    spatial_bin <- binning[2]
+
+  # binning = {spectral, spatial}
+  bin_m <- regmatches(content,
+    regexpr("(?<=binning = \\{)[0-9]+, [0-9]+(?=\\})", content, perl = TRUE))
+  if (length(bin_m) > 0 && bin_m != "") {
+    b <- as.numeric(strsplit(bin_m, ", ")[[1]])
+    spec_bin <- b[1]; spat_bin <- b[2]
   } else {
-    spectral_bin <- NA
-    spatial_bin <- NA
+    spec_bin <- NA_real_; spat_bin <- NA_real_
   }
-  
+
+  # Camera from sensor type line
+  sensor_raw <- xval("(?<=sensor type = )[^\n]+")
+  camera <- if (!is.na(sensor_raw)) {
+    if (grepl("SWIR", sensor_raw, ignore.case = TRUE)) "SWIR" else "VNIR"
+  } else NA_character_
+
+  # Calibration pack path
+  cal_raw <- xval("(?<=calibration pack = )[^\n]+")
+  cal     <- if (!is.na(cal_raw)) trimws(cal_raw) else NA_character_
+
   list(
-    lines = extract_numeric("lines"),
-    samples = extract_numeric("samples"),
-    bands = extract_numeric("bands"),
-    fps = extract_numeric("fps"),
-    tint = extract_numeric("tint"),
-    sensor_id = extract_numeric("sensorid"),
-    spectral_binning = spectral_bin,
-    spatial_binning = spatial_bin,
-    acquisition_date = extract_value("(?<=acquisition date = DATE\\(yyyy-mm-dd\\): )[0-9-]+"),
-    start_time = extract_value("(?<=Start Time = UTC TIME: )[0-9:]+"),
-    stop_time = extract_value("(?<=Stop Time = UTC TIME: )[0-9:]+")
+    lines            = xnum("lines"),
+    samples          = xnum("samples"),
+    bands            = xnum("bands"),
+    fps              = xnum("fps"),
+    tint             = xnum("tint"),
+    spectral_binning = spec_bin,
+    spatial_binning  = spat_bin,
+    camera           = camera,
+    calibration_pack = cal,
+    acquisition_date = xval("(?<=acquisition date = DATE\\(yyyy-mm-dd\\): )[0-9-]+"),
+    start_time       = xval("(?<=Start Time = UTC TIME: )[0-9:]+"),
+    stop_time        = xval("(?<=Stop Time = UTC TIME: )[0-9:]+")
   )
 }
 
-# Parse .log file for dropped frames
+# Parse Lumo .log file
 parse_log <- function(log_path) {
-  if (!file.exists(log_path)) return(list(dropped = NA, recorded = NA))
-  
+  if (!file.exists(log_path))
+    return(list(dropped = NA_real_, recorded = NA_real_))
+
   content <- paste(readLines(log_path, warn = FALSE), collapse = "\n")
-  
-  dropped <- as.numeric(regmatches(content, regexpr("(?<=incidents, )[0-9]+(?= dropped frames)", content, perl = TRUE)))
-  recorded <- as.numeric(regmatches(content, regexpr("[0-9]+(?= frames recorded)", content, perl = TRUE)))
-  
+
+  dropped  <- regmatches(content,
+    regexpr("(?<=incidents, )[0-9]+(?= dropped frames)", content, perl = TRUE))
+  recorded <- regmatches(content,
+    regexpr("[0-9]+(?= frames recorded)", content, perl = TRUE))
+
   list(
-    dropped = if (length(dropped) == 0) NA else dropped,
-    recorded = if (length(recorded) == 0) NA else recorded
+    dropped  = if (length(dropped)  == 0) NA_real_ else as.numeric(dropped),
+    recorded = if (length(recorded) == 0) NA_real_ else as.numeric(recorded)
   )
 }
 
-# Zero-pad numbers for natural sorting
-zero_pad <- function(x, width = 2) {
-  if (is.na(x)) return(NA)
-  sprintf(paste0("%0", width, "d"), as.integer(x))
+# Three-tier aspect ratio classification
+ratio_tier <- function(ratio) {
+  if (is.na(ratio))                          return(list(theme = "secondary", icon = "square",        label = "—"))
+  if (ratio >= 0.95 && ratio <= 1.05)        return(list(theme = "success",   icon = "check-square",  label = "✓ Square pixels"))
+  if (ratio >= 0.90 && ratio <= 1.10)        return(list(theme = "warning",   icon = "exclamation-square", label = "⚠ Nearly square — check"))
+  return(                                           list(theme = "danger",    icon = "x-square",      label = "✗ Not square — adjust FOV"))
 }
 
-# Generate YAML content for individual scan log
-generate_yaml <- function(data) {
-  yaml_list <- list(
-    location = list(
-      site_name = data$site_name,
-      site_code = data$site_code,
-      country = data$country,
-      country_code = tolower(data$country_code)
+# YAML export schema
+generate_yaml <- function(d) {
+  scan_len <- if (!is.na(d$target_start) && !is.na(d$target_stop))
+    d$target_stop - d$target_start else NA
+
+  as.yaml(list(
+    session = list(
+      session_id      = d$session_id,
+      operator        = d$operator,
+      date            = d$scan_date,
+      campaign_prefix = d$campaign_prefix,
+      dataset_name    = d$dataset_name
+    ),
+    instrument = list(
+      camera            = d$camera,
+      lens              = d$lens,
+      calibration_pack  = d$calibration_pack,
+      fov_mm            = d$fov,
+      et_target_ms      = d$et_target,
+      et_white_ms       = d$et_white,
+      spectral_binning  = d$spectral_binning,
+      spatial_binning   = d$spatial_binning
+    ),
+    geometry = list(
+      target_start_mm       = d$target_start,
+      target_stop_mm        = d$target_stop,
+      scan_length_mm        = scan_len,
+      test_scan_start_mm    = d$test_scan_start,
+      test_scan_stop_mm     = d$test_scan_stop,
+      measured_aspect_ratio = d$aspect_ratio
+    ),
+    scan = list(
+      filename              = d$filename,
+      total_lines           = d$total_lines,
+      dropped_frames        = d$dropped_frames,
+      saturation_ratio_pct  = d$saturation_ratio,
+      gcp_pins              = d$gcp_pins
     ),
     sample = list(
-      core_id = data$core_id,
-      section_depth = data$section_depth,
-      section_number = zero_pad(data$section_number),
-      material_type = data$material_type
+      core_id        = d$core_id,
+      section_depth  = d$section_depth,
+      material_type  = d$material_type,
+      material_owner = d$material_owner
     ),
-    ownership = list(
-      material_owner = data$material_owner,
-      operator = data$operator
+    location = list(
+      site_name = d$site_name,
+      site_code = d$site_code,
+      country   = d$country
     ),
-    scan_setup = list(
-      camera = data$camera,
-      date = data$scan_date,
-      time = data$scan_time,
-      scan_start_mm = data$scan_start,
-      scan_end_mm = data$scan_end,
-      fov_mm = data$fov,
-      spectral_binning = data$spectral_binning,
-      spatial_binning = data$spatial_binning,
-      integration_time = data$integration_time,
-      frame_rate = data$frame_rate
-    ),
-    references = list(
-      additional_whiteref = data$additional_whiteref,
-      additional_whiteref_exposure = data$whiteref_exposure
-    ),
-    results = list(
-      pixel_resolution_um = data$pixel_resolution,
-      aspect_ratio = data$aspect_ratio,
-      total_lines = data$total_lines,
-      dropped_frames = data$dropped_frames
-    ),
-    admin = list(
-      project = data$project,
-      filename = data$filename,
-      comments = data$comments
-    )
-  )
-  
-  as.yaml(yaml_list)
+    notes = d$notes
+  ))
 }
 
-# Generate CSV row for master log
-generate_csv_row <- function(data) {
+# CSV row for master log
+generate_csv_row <- function(d) {
+  scan_len <- if (!is.na(d$target_start) && !is.na(d$target_stop))
+    d$target_stop - d$target_start else NA
+
   data.frame(
-    timestamp = format(Sys.time(), "%Y-%m-%d %H:%M:%S"),
-    site_name = data$site_name,
-    site_code = data$site_code,
-    country = data$country,
-    country_code = tolower(data$country_code),
-    core_id = data$core_id,
-    section_depth = data$section_depth,
-    section_number = zero_pad(data$section_number),
-    material_type = data$material_type,
-    material_owner = data$material_owner,
-    operator = data$operator,
-    camera = data$camera,
-    scan_date = data$scan_date,
-    scan_time = data$scan_time,
-    scan_start_mm = data$scan_start,
-    scan_end_mm = data$scan_end,
-    fov_mm = data$fov,
-    spectral_binning = data$spectral_binning,
-    spatial_binning = data$spatial_binning,
-    integration_time = data$integration_time,
-    frame_rate = data$frame_rate,
-    additional_whiteref = data$additional_whiteref,
-    whiteref_exposure = data$whiteref_exposure,
-    pixel_resolution_um = data$pixel_resolution,
-    aspect_ratio = data$aspect_ratio,
-    total_lines = data$total_lines,
-    dropped_frames = data$dropped_frames,
-    project = data$project,
-    filename = data$filename,
-    comments = data$comments,
-    stringsAsFactors = FALSE
+    logged_at            = format(Sys.time(), "%Y-%m-%dT%H:%M:%S"),
+    session_id           = d$session_id,
+    operator             = d$operator,
+    scan_date            = d$scan_date,
+    campaign_prefix      = d$campaign_prefix,
+    dataset_name         = d$dataset_name,
+    filename             = d$filename,
+    camera               = d$camera,
+    lens                 = d$lens,
+    calibration_pack     = d$calibration_pack,
+    fov_mm               = d$fov,
+    et_target_ms         = d$et_target,
+    et_white_ms          = d$et_white,
+    spectral_binning     = d$spectral_binning,
+    spatial_binning      = d$spatial_binning,
+    target_start_mm      = d$target_start,
+    target_stop_mm       = d$target_stop,
+    scan_length_mm       = scan_len,
+    test_scan_start_mm   = d$test_scan_start,
+    test_scan_stop_mm    = d$test_scan_stop,
+    aspect_ratio         = d$aspect_ratio,
+    total_lines          = d$total_lines,
+    dropped_frames       = d$dropped_frames,
+    saturation_ratio_pct = d$saturation_ratio,
+    gcp_pins             = d$gcp_pins,
+    core_id              = d$core_id,
+    section_depth        = d$section_depth,
+    material_type        = d$material_type,
+    material_owner       = d$material_owner,
+    site_name            = d$site_name,
+    site_code            = d$site_code,
+    country              = d$country,
+    notes                = d$notes,
+    stringsAsFactors     = FALSE
   )
 }
 
@@ -206,121 +229,159 @@ generate_csv_row <- function(data) {
 # ============================================================================
 
 ui <- page_sidebar(
-  title = "HSI Calibration Tool",
-  theme = bs_theme(version = 5, bootswatch = "flatly", "navbar-bg" = "#2C3E50"),
-  fillable = FALSE,  # Allow page to scroll
-  
+  title   = "HSI Calibration Tool",
+  theme   = bs_theme(version = 5, bootswatch = "flatly", "navbar-bg" = "#2C3E50"),
+  fillable = FALSE,
+
   sidebar = sidebar(
-    width = 300,
-    
-    # File selection (shared)
-    shinyFilesButton(
-      id = "file_select",
-      label = "Select raster file",
-      title = "Choose a raster file",
-      multiple = FALSE,
-      icon = icon("file")
-    ),
-    verbatimTextOutput("file_path", placeholder = TRUE),
-    
-    hr(),
-    
-    # Scan length input (shared for Tab 1 & 2)
+    width = 310,
+
+    # ------------------------------------------------------------------
+    # Sidebar content for Tabs 1 & 2
+    # ------------------------------------------------------------------
     conditionalPanel(
-      condition = "input.tabs != 'Scan Log'",
-      h6("Scan Length"),
+      condition = "input.tabs !== 'Scan Log'",
+
+      h6("Raster file (test scan)"),
+      shinyFilesButton(
+        id = "file_select", label = "Select raster file",
+        title = "Choose a raster file (.raw or .tif)",
+        multiple = FALSE, icon = icon("file")
+      ),
+      verbatimTextOutput("file_path", placeholder = TRUE),
+
+      hr(),
+
+      h6(tip(
+        "Motor positions",
+        "Read Target start and Target stop from Lumo's motor position display.
+         These values are NOT saved in any Lumo output file — record them in
+         your notebook first, then enter here. Scan length = Stop − Start."
+      )),
       layout_columns(
-        col_widths = c(7, 5),
-        numericInput("scan_len", label = NULL, value = NULL, min = 0),
-        selectInput("scan_len_unit", label = NULL,
-                    choices = c("cm", "mm", "µm" = "um"), selected = "cm")
+        col_widths = c(6, 6),
+        numericInput("motor_start", "Start (mm)", value = NULL, min = 0),
+        numericInput("motor_stop",  "Stop (mm)",  value = NULL, min = 0)
+      ),
+
+      # FOV only shown in Tab 1
+      conditionalPanel(
+        condition = "input.tabs === 'Check Calibration'",
+        hr(),
+        h6(tip(
+          "Field of view (mm)",
+          "The FOV value currently set in Lumo's Scanning speed calculation
+           panel. Enter in millimetres."
+        )),
+        numericInput("scan_fov", NULL, value = NULL, min = 0)
       )
     ),
-    
-    # FOV input (Tab 1 only)
+
+    # ------------------------------------------------------------------
+    # Sidebar content for Tab 3
+    # ------------------------------------------------------------------
     conditionalPanel(
-      condition = "input.tabs == 'Check Calibration'",
+      condition = "input.tabs === 'Scan Log'",
+
+      h6("Core scan files"),
+      shinyFilesButton(
+        id = "core_hdr_select", label = "Select core .hdr",
+        title = "Choose the core scan .hdr file",
+        multiple = FALSE, icon = icon("file-code")
+      ),
+      verbatimTextOutput("core_hdr_path", placeholder = TRUE),
+
+      shinyFilesButton(
+        id = "core_log_select", label = "Select core .log",
+        title = "Choose the core scan .log file",
+        multiple = FALSE, icon = icon("file-lines")
+      ),
+      verbatimTextOutput("core_log_path", placeholder = TRUE),
+
+      actionButton("load_core", "Load core metadata",
+                   icon = icon("download"),
+                   class = "btn-primary w-100 mb-2"),
+
       hr(),
-      h6("Field of View (measured)"),
-      layout_columns(
-        col_widths = c(7, 5),
-        numericInput("scan_fov", label = NULL, value = NULL, min = 0),
-        selectInput("scan_fov_unit", label = NULL,
-                    choices = c("cm", "mm", "µm" = "um"), selected = "mm")
-      )
-    ),
-    
-    # Tab 3 sidebar controls
-    conditionalPanel(
-      condition = "input.tabs == 'Scan Log'",
-      
-      actionButton("load_from_raster", "Load metadata from raster",
-                   icon = icon("download"), class = "btn-primary mb-3 w-100"),
-      
+
+      h6("White reference file"),
+      shinyFilesButton(
+        id = "white_hdr_select", label = "Select white ref .hdr",
+        title = "Choose the white reference .hdr file",
+        multiple = FALSE, icon = icon("file-code")
+      ),
+      verbatimTextOutput("white_hdr_path", placeholder = TRUE),
+
+      actionButton("load_white", "Load ET_white",
+                   icon = icon("download"),
+                   class = "btn-outline-primary w-100 mb-2"),
+
       hr(),
-      
-      h6("Individual file save location"),
+
+      h6("Save location"),
       shinyDirButton(
-        id = "save_dir",
-        label = "Choose folder",
-        title = "Select folder for individual scan log",
+        id = "save_dir", label = "Choose folder",
+        title = "Select folder for scan logs",
         icon = icon("folder-open")
       ),
       verbatimTextOutput("save_dir_path", placeholder = TRUE)
     )
   ),
-  
-  # Main panel with tabs
+
+  # ============================================================================
+  # Main panel
+  # ============================================================================
+
   navset_card_tab(
     id = "tabs",
-    
-    # =========================================================================
-    # Tab 1: Check Calibration
-    # =========================================================================
+
+    # ==========================================================================
+    # Tab 1 — Check pixel aspect ratio
+    # ==========================================================================
     nav_panel(
       title = "Check Calibration",
-      icon = icon("check-circle"),
-      
+      icon  = icon("check-circle"),
+
       layout_columns(
         col_widths = 12,
-        
+
         card(
-          card_header("Raster Dimensions"),
+          card_header("Raster dimensions"),
           card_body(
             layout_columns(
               col_widths = c(6, 6),
               value_box(
-                title = "Rows",
-                value = textOutput("check_n_rows", inline = TRUE),
-                showcase = icon("arrows-up-down"),
-                theme = "secondary"
+                title    = "Scan lines (rows)",
+                value    = textOutput("check_n_rows", inline = TRUE),
+                showcase = bs_icon("arrow-down-up"),
+                theme    = "secondary"
               ),
               value_box(
-                title = "Columns",
-                value = textOutput("check_n_cols", inline = TRUE),
-                showcase = icon("arrows-left-right"),
-                theme = "secondary"
+                title    = "Spatial pixels (columns)",
+                value    = textOutput("check_n_cols", inline = TRUE),
+                showcase = bs_icon("arrow-left-right"),
+                theme    = "secondary"
               )
             )
           )
         ),
-        
+
         card(
-          card_header("Calculated Resolution"),
+          card_header("Pixel resolution & aspect ratio"),
           card_body(
             layout_columns(
               col_widths = c(4, 4, 4),
               value_box(
-                title = "Length Resolution",
-                value = textOutput("res_len", inline = TRUE),
-                showcase = icon("ruler-vertical"),
-                theme = "primary"
+                title    = "Along-track pixel size",
+                value    = textOutput("res_len", inline = TRUE),
+                showcase = bs_icon("arrow-down-up"),
+                theme    = "primary"
               ),
               value_box(
-                title = "FOV Resolution",
-                value = textOutput("res_fov", inline = TRUE),
-                showcase = icon("ruler-horizontal"),
-                theme = "primary"
+                title    = "Across-track pixel size",
+                value    = textOutput("res_fov", inline = TRUE),
+                showcase = bs_icon("arrow-left-right"),
+                theme    = "primary"
               ),
               uiOutput("ratio_box")
             )
@@ -328,559 +389,710 @@ ui <- page_sidebar(
         )
       )
     ),
-    
-    # =========================================================================
-    # Tab 2: Calculate Ideal FOV
-    # =========================================================================
+
+    # ==========================================================================
+    # Tab 2 — Calculate ideal FOV
+    # ==========================================================================
     nav_panel(
       title = "Calculate Ideal FOV",
-      icon = icon("calculator"),
-      
+      icon  = icon("calculator"),
+
       layout_columns(
         col_widths = 12,
-        
+
         card(
-          card_header("Raster Dimensions"),
+          card_header("Raster dimensions"),
           card_body(
             layout_columns(
               col_widths = c(6, 6),
               value_box(
-                title = "Rows",
-                value = textOutput("calc_n_rows", inline = TRUE),
-                showcase = icon("arrows-up-down"),
-                theme = "secondary"
+                title    = "Scan lines (rows)",
+                value    = textOutput("calc_n_rows", inline = TRUE),
+                showcase = bs_icon("arrow-down-up"),
+                theme    = "secondary"
               ),
               value_box(
-                title = "Columns",
-                value = textOutput("calc_n_cols", inline = TRUE),
-                showcase = icon("arrows-left-right"),
-                theme = "secondary"
+                title    = "Spatial pixels (columns)",
+                value    = textOutput("calc_n_cols", inline = TRUE),
+                showcase = bs_icon("arrow-left-right"),
+                theme    = "secondary"
               )
             )
           )
         ),
-        
+
         card(
-          card_header("True Pixel Size (from scan length)"),
+          card_header("Along-track pixel size (from motor positions)"),
           card_body(
             value_box(
-              title = "Pixel Resolution",
-              value = textOutput("true_pixel_size", inline = TRUE),
-              showcase = icon("expand"),
-              theme = "primary"
+              title    = "Pixel resolution",
+              value    = textOutput("true_pixel_size", inline = TRUE),
+              showcase = bs_icon("rulers"),
+              theme    = "primary"
             )
           )
         ),
-        
+
         card(
-          card_header("Ideal FOV for Square Pixels"),
+          card_header(
+            tags$span(
+              "Ideal FOV for square pixels",
+              tags$small(class = "text-muted ms-2",
+                "— enter the mm value in Lumo's Scanning speed calculation panel")
+            )
+          ),
           card_body(
             layout_columns(
               col_widths = c(4, 4, 4),
               value_box(
-                title = "FOV",
-                value = textOutput("ideal_fov_um", inline = TRUE),
-                p("micrometers"),
-                showcase = icon("ruler-horizontal"),
-                theme = "success"
-              ),
-              value_box(
-                title = "FOV",
-                value = textOutput("ideal_fov_mm", inline = TRUE),
+                title    = "FOV",
+                value    = textOutput("ideal_fov_mm", inline = TRUE),
                 p("millimeters"),
-                showcase = icon("ruler-horizontal"),
-                theme = "success"
+                showcase = bs_icon("rulers"),
+                theme    = "success"
               ),
               value_box(
-                title = "FOV",
-                value = textOutput("ideal_fov_cm", inline = TRUE),
+                title    = "FOV",
+                value    = textOutput("ideal_fov_um", inline = TRUE),
+                p("micrometers"),
+                showcase = bs_icon("rulers"),
+                theme    = "success"
+              ),
+              value_box(
+                title    = "FOV",
+                value    = textOutput("ideal_fov_cm", inline = TRUE),
                 p("centimeters"),
-                showcase = icon("ruler-horizontal"),
-                theme = "success"
+                showcase = bs_icon("rulers"),
+                theme    = "success"
               )
             )
           )
         )
       )
     ),
-    
-    # =========================================================================
-    # Tab 3: Scan Log
-    # =========================================================================
+
+    # ==========================================================================
+    # Tab 3 — Scan Log
+    # ==========================================================================
     nav_panel(
       title = "Scan Log",
-      icon = icon("clipboard-list"),
-      
-      # Row 1: Location, Sample, Ownership
+      icon  = icon("clipboard-list"),
+
+      # Row 1: Session & Identity | Instrument | Motor Positions
       layout_columns(
         col_widths = c(4, 4, 4),
-        
+
+        # Session & Identity
         card(
-          card_header("Location", class = "bg-info text-white"),
+          card_header("Session & identity", class = "bg-dark text-white"),
           card_body(
-            textInput("site_name", "Site name (full)", placeholder = "Name"),
-            textInput("site_code", "Site code", placeholder = "CODE"),
-            textInput("country", "Country (full, English)", placeholder = "Country"),
-            textInput("country_code", "Country code (2-letter)", 
-                      placeholder = "xx")
+            textInput("session_id",
+              tip("Session ID",
+                "Groups all scans sharing the same camera, lens, FOV, ET_target,
+                 and binning. Closes when any parameter changes or after the white
+                 reference scan. Suggested format: SITE-YY-S1, e.g. LAZ-26-S1."),
+              placeholder = "LAZ-26-S1"),
+
+            textInput("operator",
+              tip("Operator", "Full first and last name of the person operating the scanner."),
+              placeholder = "Firstname Lastname"),
+
+            textInput("campaign_prefix",
+              tip("Campaign prefix",
+                "Set once in Lumo's Setup tab. Format: SITE-YY where SITE is the
+                 lake/site code and YY is the two-digit year. Example: LAZ-26."),
+              placeholder = "LAZ-26"),
+
+            textInput("dataset_name",
+              tip("Dataset name",
+                "Entered per scan in Lumo's Capture tab. Format: CC-SS with
+                 zero-padded core and section numbers. Example: 01-01 = core 1,
+                 section 1. Lumo appends this to the campaign prefix."),
+              placeholder = "01-01"),
+
+            dateInput("scan_date", "Date", value = Sys.Date()),
+
+            selectInput("camera", "Camera",
+              choices  = c("VNIR", "SWIR"),
+              selected = "VNIR")
           )
         ),
-        
+
+        # Instrument
+        card(
+          card_header("Instrument", class = "bg-primary text-white"),
+          card_body(
+            selectizeInput("lens",
+              tip("Lens",
+                "Objective lens focal length. Typical values for this setup:
+                 18.5 mm (VNIR), 50.0 mm (SWIR). You can type a custom value."),
+              choices = c("18.5 mm", "50.0 mm"),
+              options = list(create = TRUE, placeholder = "Select or type...")),
+
+            textInput("calibration_pack",
+              tip("Calibration pack",
+                "Name or path of the Specim calibration pack (.scp file) used.
+                 Auto-filled from the core scan .hdr file."),
+              placeholder = "Auto-filled from .hdr"),
+
+            numericInput("et_target",
+              tip("ET_target (ms)",
+                "Integration time for the core scan in milliseconds. Auto-filled
+                 from the core .hdr file (tint field)."),
+              value = NULL, min = 0),
+
+            numericInput("et_white",
+              tip("ET_white (ms)",
+                "Integration time for the white reference scan in milliseconds.
+                 Auto-filled from the white reference .hdr file (tint field).
+                 In this protocol ET_dark = ET_white, so the dark current scaling
+                 in the reflectance formula simplifies to 1."),
+              value = NULL, min = 0),
+
+            numericInput("log_fov",
+              tip("FOV (mm)",
+                "Field of view value entered in Lumo's Scanning speed calculation
+                 panel, in millimeters."),
+              value = NULL, min = 0),
+
+            layout_columns(
+              col_widths = c(6, 6),
+              numericInput("spectral_binning",
+                tip("Spectral binning",
+                  "First value of the binning field in the .hdr file. Typical
+                   production values: 1, 2, or 4. Auto-filled from .hdr."),
+                value = NULL, min = 1),
+              numericInput("spatial_binning",
+                tip("Spatial binning",
+                  "Second value of the binning field in the .hdr file. Always 1
+                   in production scans; may differ in test scans. Auto-filled."),
+                value = NULL, min = 1)
+            )
+          )
+        ),
+
+        # Motor Positions
+        card(
+          card_header("Motor positions", class = "bg-info text-white"),
+          card_body(
+            p(class = "text-muted small mb-3",
+              "Motor positions are not saved in any Lumo output file.
+               Record them from the Lumo display in your paper notebook,
+               then enter here."),
+
+            h6("Production scan"),
+            layout_columns(
+              col_widths = c(6, 6),
+              numericInput("target_start",
+                tip("Target start (mm)",
+                  "Motor position displayed in Lumo at the beginning of the
+                   core scan. Read from the Lumo interface."),
+                value = NULL),
+              numericInput("target_stop",
+                tip("Target stop (mm)",
+                  "Motor position displayed in Lumo at the end of the core
+                   scan. Scan length = Stop − Start."),
+                value = NULL)
+            ),
+
+            hr(),
+
+            h6("Test scan (geometry calibration)"),
+            layout_columns(
+              col_widths = c(6, 6),
+              numericInput("test_scan_start",
+                tip("Test start (mm)",
+                  "Motor position at the start of the geometry test scan
+                   used to calculate the ideal FOV (Tab 2)."),
+                value = NULL),
+              numericInput("test_scan_stop",
+                tip("Test stop (mm)",
+                  "Motor position at the end of the geometry test scan."),
+                value = NULL)
+            )
+          )
+        )
+      ),
+
+      # Row 2: Sample | Location | Results & QC
+      layout_columns(
+        col_widths = c(4, 4, 4),
+
         card(
           card_header("Sample", class = "bg-info text-white"),
           card_body(
-            textInput("core_id", "Core ID", placeholder = "CORE-ID"),
-            textInput("section_depth", "Section depth (cm)", placeholder = "0-50"),
-            numericInput("section_number", "Section number", value = 1, min = 1),
+            textInput("core_id", "Core ID", placeholder = "SITE-A"),
+            textInput("section_depth",
+              tip("Section depth (cm)",
+                "Depth range of this core section in centimetres, e.g. 0-50."),
+              placeholder = "0-50"),
             selectizeInput("material_type", "Material type",
-                           choices = NULL,
-                           options = list(create = TRUE, placeholder = "Select or add..."))
+              choices = NULL,
+              options = list(create = TRUE,
+                             placeholder = "Select or add a new type...")),
+            textInput("material_owner", "Material owner",
+              placeholder = "Institution / PI")
           )
         ),
-        
+
         card(
-          card_header("Ownership", class = "bg-info text-white"),
+          card_header("Location", class = "bg-info text-white"),
           card_body(
-            textInput("material_owner", "Material owner", 
-                      placeholder = "Institution / PI"),
-            textInput("operator", "Operator (who scanned)", 
-                      placeholder = "Initials")
+            textInput("site_name", "Site name", placeholder = "Lake Łazek"),
+            textInput("site_code",
+              tip("Site code",
+                "Short alphanumeric code used in file names and identifiers,
+                 matching the SITE part of the campaign prefix. Example: LAZ."),
+              placeholder = "LAZ"),
+            textInput("country", "Country", placeholder = "Poland")
+          )
+        ),
+
+        card(
+          card_header("Results & QC", class = "bg-success text-white"),
+          card_body(
+            numericInput("log_aspect_ratio",
+              tip("Measured aspect ratio",
+                "From Tab 1, after the geometry confirmation scan. Target range
+                 is 0.95–1.05 for acceptably square pixels."),
+              value = NULL, step = 0.001),
+
+            numericInput("log_total_lines",
+              tip("Total scan lines",
+                "Number of recorded frames (lines) in the scan. Auto-filled
+                 from the core .hdr file (lines field)."),
+              value = NULL),
+
+            numericInput("log_dropped_frames",
+              tip("Dropped frames",
+                "From the core .log file. Any value > 0 should be noted;
+                 large numbers indicate a scanning problem requiring re-scan.
+                 Auto-filled from .log."),
+              value = NULL),
+
+            numericInput("saturation_ratio",
+              tip("Saturation ratio (%)",
+                "Fraction of core-area pixel positions where any single band
+                 equals the detector ceiling DN. Calculated in R post-processing
+                 (HSItools). Threshold: 0.1% — if exceeded, reduce ET_target
+                 and re-scan. Saturated pixels are masked during reflectance
+                 calculation."),
+              value = NULL, min = 0, max = 100, step = 0.01),
+
+            numericInput("gcp_pins",
+              tip("GCP pins",
+                "Number of steel pins placed in the sediment surface for
+                 VNIR–SWIR image co-registration. Minimum 10 per section,
+                 alternating left–right, ~10 cm apart, within the SWIR FOV."),
+              value = NULL, min = 0)
           )
         )
       ),
-      
-      # Row 2: Scan Setup, References, Results
+
+      # Row 3: Filename | Notes
       layout_columns(
-        col_widths = c(4, 4, 4),
-        
+        col_widths = c(4, 8),
+
         card(
-          card_header("Scan Setup", class = "bg-primary text-white"),
+          card_header("File", class = "bg-secondary text-white"),
           card_body(
-            selectInput("camera", "Camera", 
-                        choices = c("VNIR", "SWIR"), selected = "VNIR"),
-            layout_columns(
-              col_widths = c(6, 6),
-              dateInput("scan_date", "Date", value = Sys.Date()),
-              textInput("scan_time", "Time", placeholder = "HH:MM:SS")
-            ),
-            layout_columns(
-              col_widths = c(6, 6),
-              numericInput("log_scan_start", "Scan start (mm)", value = NULL),
-              numericInput("log_scan_end", "Scan end (mm)", value = NULL)
-            ),
-            numericInput("log_fov", "FOV (mm)", value = NULL),
-            layout_columns(
-              col_widths = c(6, 6),
-              numericInput("log_spectral_bin", "Spectral bin", value = NULL),
-              numericInput("log_spatial_bin", "Spatial bin", value = NULL)
-            ),
-            layout_columns(
-              col_widths = c(6, 6),
-              numericInput("log_tint", "Integration time", value = NULL),
-              numericInput("log_fps", "Frame rate", value = NULL)
-            )
+            textInput("log_filename",
+              tip("Filename",
+                "Auto-filled from the loaded .hdr file. Lumo names files as
+                 PREFIX_CC-SS_TIMESTAMP. Used as the base name for the YAML
+                 scan log file."),
+              placeholder = "Auto-filled from .hdr")
           )
         ),
-        
+
         card(
-          card_header("References", class = "bg-warning"),
+          card_header("Notes", class = "bg-secondary text-white"),
           card_body(
-            selectInput("additional_whiteref", "Additional whiteref taken?",
-                        choices = c("No" = "no", "Yes" = "yes"), selected = "no"),
-            conditionalPanel(
-              condition = "input.additional_whiteref == 'yes'",
-              numericInput("whiteref_exposure", "Whiteref exposure", value = NULL)
-            )
-          )
-        ),
-        
-        card(
-          card_header("Results", class = "bg-success text-white"),
-          card_body(
-            numericInput("log_pixel_res", "Pixel resolution (µm/px)", value = NULL),
-            numericInput("log_aspect_ratio", "Aspect ratio", value = NULL, step = 0.001),
-            numericInput("log_total_lines", "Total lines", value = NULL),
-            numericInput("log_dropped_frames", "Dropped frames", value = NULL)
+            textAreaInput("notes", NULL, rows = 2,
+              placeholder = "Core condition, issues, anomalies, anything not captured above...")
           )
         )
       ),
-      
-      # Row 3: Admin
-      card(
-        card_header("Admin", class = "bg-secondary text-white"),
-        card_body(
-          layout_columns(
-            col_widths = c(6, 6),
-            textInput("project", "Project / Campaign", placeholder = "Project name"),
-            textInput("log_filename", "Filename", placeholder = "Auto-filled from raster")
-          ),
-          textAreaInput("comments", "Comments", rows = 3,
-                        placeholder = "Any additional notes...")
-        )
-      ),
-      
+
       # Save buttons
       card(
         card_body(
           layout_columns(
             col_widths = c(4, 4, 4),
-            actionButton("save_individual", "Save Individual (YAML)",
-                         icon = icon("file-export"), class = "btn-outline-primary w-100"),
-            actionButton("save_master", "Save to Master Log (CSV)",
-                         icon = icon("database"), class = "btn-outline-success w-100"),
+            actionButton("save_individual", "Save YAML",
+              icon = icon("file-export"),
+              class = "btn-outline-primary w-100"),
+            actionButton("save_master", "Append to master CSV",
+              icon = icon("database"),
+              class = "btn-outline-success w-100"),
             actionButton("save_both", "Save Both",
-                         icon = icon("save"), class = "btn-primary w-100")
+              icon = icon("floppy-disk"),
+              class = "btn-primary w-100")
           )
         )
       )
-    )
-  )
-)
+    ) # end Tab 3 nav_panel
+  )   # end navset_card_tab
+)     # end page_sidebar
 
 # ============================================================================
 # Server
 # ============================================================================
 
 server <- function(input, output, session) {
-  
-  # Initialize volumes for file/folder pickers
+
   volumes <- getVolumes()()
-  
+
+  # File choosers — Tabs 1 & 2
   shinyFileChoose(input, "file_select", roots = volumes,
                   filetypes = c("raw", "tif", "tiff"))
-  
+
+  # File choosers — Tab 3 (separate)
+  shinyFileChoose(input, "core_hdr_select",  roots = volumes, filetypes = "hdr")
+  shinyFileChoose(input, "core_log_select",  roots = volumes, filetypes = "log")
+  shinyFileChoose(input, "white_hdr_select", roots = volumes, filetypes = "hdr")
   shinyDirChoose(input, "save_dir", roots = volumes)
-  
-  # Load and initialize material types
+
+  # Material types (persisted in ~/.hsical)
   material_types <- reactiveVal(load_material_types())
-  
+
   observe({
     updateSelectizeInput(session, "material_type",
-                         choices = material_types(),
-                         server = TRUE)
+                         choices = material_types(), server = TRUE)
   })
-  
-  # When user adds a new material type, persist it
+
   observeEvent(input$material_type, {
-    if (!is.null(input$material_type) && 
-        input$material_type != "" &&
-        !input$material_type %in% material_types()) {
-      new_types <- c(material_types(), input$material_type)
-      material_types(new_types)
-      save_material_types(new_types)
+    mt <- input$material_type
+    if (!is.null(mt) && mt != "" && !mt %in% material_types()) {
+      updated <- c(material_types(), mt)
+      material_types(updated)
+      save_material_types(updated)
     }
   })
-  
-  # Auto-fill country code from country name
- observeEvent(input$country, {
-    req(input$country)
-    if (nchar(input$country) >= 3) {
-      code <- tryCatch(
-        countrycode(input$country, origin = "country.name", destination = "iso2c"),
-        warning = \(w) NA,
-        error = \(e) NA
-      )
-      if (!is.na(code)) {
-        updateTextInput(session, "country_code", value = tolower(code))
-      }
-    }
-  })
-  
-  # ---------------------------------------------------------------------------
-  # Shared reactives
-  # ---------------------------------------------------------------------------
-  
+
+  # --------------------------------------------------------------------------
+  # Tabs 1 & 2 — shared reactives
+  # --------------------------------------------------------------------------
+
   selected_path <- reactive({
     req(input$file_select)
-    file_info <- parseFilePaths(volumes, input$file_select)
-    if (nrow(file_info) == 0) return(NULL)
-    as.character(file_info$datapath)
+    fi <- parseFilePaths(volumes, input$file_select)
+    if (nrow(fi) == 0) return(NULL)
+    as.character(fi$datapath)
   })
-  
+
+  output$file_path <- renderText({
+    if (is.null(selected_path())) "No file selected" else basename(selected_path())
+  })
+
   raster_data <- reactive({
     req(selected_path())
     tryCatch(
       terra::rast(selected_path()),
       error = \(e) {
-        showNotification(paste("Error reading raster:", e$message), type = "error")
+        showNotification(paste("Cannot read raster:", e$message), type = "error")
         NULL
       }
     )
   })
-  
-  scan_len_um <- reactive({
-    req(input$scan_len, input$scan_len > 0)
-    conv_unit(input$scan_len, input$scan_len_unit, "um")
+
+  # Scan length derived from motor positions, always in mm then converted
+  scan_len_mm <- reactive({
+    req(input$motor_start, input$motor_stop)
+    len <- input$motor_stop - input$motor_start
+    req(len > 0)
+    len
   })
-  
+
+  scan_len_um <- reactive({
+    req(scan_len_mm())
+    conv_unit(scan_len_mm(), "mm", "um")
+  })
+
+  # Along-track pixel size
   true_pixel_res <- reactive({
     req(raster_data(), scan_len_um())
     scan_len_um() / nrow(raster_data())
   })
-  
+
+  # Tab 1 calculations
   check_calculations <- reactive({
     req(raster_data(), scan_len_um(), input$scan_fov, input$scan_fov > 0)
-    r <- raster_data()
-    fov_um <- conv_unit(input$scan_fov, input$scan_fov_unit, "um")
+    r       <- raster_data()
+    fov_um  <- conv_unit(input$scan_fov, "mm", "um")
     res_len <- scan_len_um() / nrow(r)
     res_fov <- fov_um / ncol(r)
     list(res_len = res_len, res_fov = res_fov, ratio = res_len / res_fov)
   })
-  
+
+  # Tab 2 ideal FOV
   ideal_fov <- reactive({
     req(raster_data(), true_pixel_res())
-    r <- raster_data()
-    fov_um <- true_pixel_res() * ncol(r)
+    fov_um <- true_pixel_res() * ncol(raster_data())
     list(
       um = fov_um,
       mm = conv_unit(fov_um, "um", "mm"),
       cm = conv_unit(fov_um, "um", "cm")
     )
   })
-  
-  # ---------------------------------------------------------------------------
-  # Outputs: File path display
-  # ---------------------------------------------------------------------------
-  
-  output$file_path <- renderText({
-    path <- selected_path()
-    if (is.null(path)) "No file selected" else basename(path)
-  })
-  
-  # ---------------------------------------------------------------------------
-  # Outputs: Tab 1 - Check Calibration
-  # ---------------------------------------------------------------------------
-  
+
+  # --------------------------------------------------------------------------
+  # Tab 1 outputs
+  # --------------------------------------------------------------------------
+
   output$check_n_rows <- renderText({
     r <- raster_data()
     if (is.null(r)) "—" else format(nrow(r), big.mark = ",")
   })
-  
+
   output$check_n_cols <- renderText({
     r <- raster_data()
     if (is.null(r)) "—" else format(ncol(r), big.mark = ",")
   })
-  
+
   output$res_len <- renderText({
     calc <- check_calculations()
     if (is.null(calc)) "—" else paste(round(calc$res_len, 2), "µm/px")
   })
-  
+
   output$res_fov <- renderText({
     calc <- check_calculations()
     if (is.null(calc)) "—" else paste(round(calc$res_fov, 2), "µm/px")
   })
-  
+
   output$ratio_box <- renderUI({
-    calc <- check_calculations()
-    if (is.null(calc)) {
-      value_box(title = "Aspect Ratio", value = "—",
-                showcase = icon("square"), theme = "secondary")
-    } else {
-      ratio <- calc$ratio
-      is_square <- ratio >= 0.95 && ratio <= 1.05
-      value_box(
-        title = "Aspect Ratio",
-        value = round(ratio, 3),
-        p(if (is_square) "✓ Pixels are square" else "⚠ Pixels not square"),
-        showcase = icon(if (is_square) "square-check" else "square"),
-        theme = if (is_square) "success" else "warning"
-      )
-    }
+    calc  <- check_calculations()
+    ratio <- if (is.null(calc)) NA_real_ else calc$ratio
+    tier  <- ratio_tier(ratio)
+    value_box(
+      title    = "Aspect ratio",
+      value    = if (is.na(ratio)) "—" else round(ratio, 3),
+      p(tier$label),
+      showcase = bs_icon(tier$icon),
+      theme    = tier$theme
+    )
   })
-  
-  # ---------------------------------------------------------------------------
-  # Outputs: Tab 2 - Calculate Ideal FOV
-  # ---------------------------------------------------------------------------
-  
+
+  # --------------------------------------------------------------------------
+  # Tab 2 outputs
+  # --------------------------------------------------------------------------
+
   output$calc_n_rows <- renderText({
     r <- raster_data()
     if (is.null(r)) "—" else format(nrow(r), big.mark = ",")
   })
-  
+
   output$calc_n_cols <- renderText({
     r <- raster_data()
     if (is.null(r)) "—" else format(ncol(r), big.mark = ",")
   })
-  
+
   output$true_pixel_size <- renderText({
     res <- true_pixel_res()
     if (is.null(res)) "—" else paste(round(res, 2), "µm/px")
   })
-  
+
+  output$ideal_fov_mm <- renderText({
+    fov <- ideal_fov()
+    if (is.null(fov)) "—" else round(fov$mm, 3)
+  })
+
   output$ideal_fov_um <- renderText({
     fov <- ideal_fov()
     if (is.null(fov)) "—" else format(round(fov$um, 1), big.mark = ",")
   })
-  
-  output$ideal_fov_mm <- renderText({
-    fov <- ideal_fov()
-    if (is.null(fov)) "—" else round(fov$mm, 2)
-  })
-  
+
   output$ideal_fov_cm <- renderText({
     fov <- ideal_fov()
-    if (is.null(fov)) "—" else round(fov$cm, 3)
+    if (is.null(fov)) "—" else round(fov$cm, 4)
   })
-  
-  # ---------------------------------------------------------------------------
-  # Tab 3: Save directory path display
-  # ---------------------------------------------------------------------------
-  
+
+  # --------------------------------------------------------------------------
+  # Tab 3 — file path reactives
+  # --------------------------------------------------------------------------
+
+  core_hdr_path <- reactive({
+    req(input$core_hdr_select)
+    fi <- parseFilePaths(volumes, input$core_hdr_select)
+    if (nrow(fi) == 0) return(NULL)
+    as.character(fi$datapath)
+  })
+
+  core_log_path <- reactive({
+    req(input$core_log_select)
+    fi <- parseFilePaths(volumes, input$core_log_select)
+    if (nrow(fi) == 0) return(NULL)
+    as.character(fi$datapath)
+  })
+
+  white_hdr_path <- reactive({
+    req(input$white_hdr_select)
+    fi <- parseFilePaths(volumes, input$white_hdr_select)
+    if (nrow(fi) == 0) return(NULL)
+    as.character(fi$datapath)
+  })
+
   selected_save_dir <- reactive({
     req(input$save_dir)
     path <- parseDirPath(volumes, input$save_dir)
     if (length(path) == 0) return(NULL)
     as.character(path)
   })
-  
-  output$save_dir_path <- renderText({
-    dir <- selected_save_dir()
-    if (is.null(dir)) "No folder selected" else dir
+
+  output$core_hdr_path  <- renderText({
+    if (is.null(core_hdr_path()))  "No file selected" else basename(core_hdr_path())
   })
-  
-  # ---------------------------------------------------------------------------
-  # Tab 3: Load metadata from raster
-  # ---------------------------------------------------------------------------
-  
-  observeEvent(input$load_from_raster, {
-    req(selected_path())
-    
-    raster_path <- selected_path()
-    base_path <- tools::file_path_sans_ext(raster_path)
-    hdr_path <- paste0(base_path, ".hdr")
-    log_path <- paste0(base_path, ".log")
-    
-    hdr_data <- parse_hdr(hdr_path)
-    log_data <- parse_log(log_path)
-    
-    if (!is.null(hdr_data)) {
-      updateNumericInput(session, "log_spectral_bin", value = hdr_data$spectral_binning)
-      updateNumericInput(session, "log_spatial_bin", value = hdr_data$spatial_binning)
-      updateNumericInput(session, "log_tint", value = round(hdr_data$tint, 2))
-      updateNumericInput(session, "log_fps", value = hdr_data$fps)
-      updateNumericInput(session, "log_total_lines", value = hdr_data$lines)
-      
-      if (!is.na(hdr_data$acquisition_date)) {
-        updateDateInput(session, "scan_date", value = as.Date(hdr_data$acquisition_date))
-      }
-      if (!is.na(hdr_data$start_time)) {
-        updateTextInput(session, "scan_time", value = hdr_data$start_time)
+  output$core_log_path  <- renderText({
+    if (is.null(core_log_path()))  "No file selected" else basename(core_log_path())
+  })
+  output$white_hdr_path <- renderText({
+    if (is.null(white_hdr_path())) "No file selected" else basename(white_hdr_path())
+  })
+  output$save_dir_path  <- renderText({
+    if (is.null(selected_save_dir())) "No folder selected" else selected_save_dir()
+  })
+
+  # --------------------------------------------------------------------------
+  # Tab 3 — load core metadata (HDR + LOG)
+  # --------------------------------------------------------------------------
+
+  observeEvent(input$load_core, {
+    req(core_hdr_path())
+
+    hdr <- parse_hdr(core_hdr_path())
+
+    if (!is.null(hdr)) {
+      if (!is.na(hdr$camera))            updateSelectInput(session,  "camera",            value = hdr$camera)
+      if (!is.na(hdr$tint))              updateNumericInput(session, "et_target",          value = round(hdr$tint, 3))
+      if (!is.na(hdr$spectral_binning))  updateNumericInput(session, "spectral_binning",   value = hdr$spectral_binning)
+      if (!is.na(hdr$spatial_binning))   updateNumericInput(session, "spatial_binning",    value = hdr$spatial_binning)
+      if (!is.na(hdr$calibration_pack))  updateTextInput(session,    "calibration_pack",   value = hdr$calibration_pack)
+      if (!is.na(hdr$acquisition_date))  updateDateInput(session,    "scan_date",          value = as.Date(hdr$acquisition_date))
+      if (!is.na(hdr$lines))             updateNumericInput(session, "log_total_lines",    value = hdr$lines)
+      updateTextInput(session, "log_filename", value = basename(core_hdr_path()))
+    }
+
+    # Load dropped frames from .log if already selected
+    if (!is.null(core_log_path())) {
+      log_data <- parse_log(core_log_path())
+      if (!is.na(log_data$dropped)) {
+        updateNumericInput(session, "log_dropped_frames", value = log_data$dropped)
       }
     }
-    
-    if (!is.null(log_data)) {
+
+    showNotification("Core metadata loaded from .hdr", type = "message")
+  })
+
+  # Load .log separately if selected after core was already loaded
+  observeEvent(input$core_log_select, {
+    req(core_log_path())
+    log_data <- parse_log(core_log_path())
+    if (!is.na(log_data$dropped)) {
       updateNumericInput(session, "log_dropped_frames", value = log_data$dropped)
     }
-    
-    updateTextInput(session, "log_filename", value = basename(raster_path))
-    
-    calc <- check_calculations()
-    if (!is.null(calc)) {
-      updateNumericInput(session, "log_pixel_res", value = round(calc$res_len, 2))
-      updateNumericInput(session, "log_aspect_ratio", value = round(calc$ratio, 3))
-    }
-    
-    showNotification("Metadata loaded from raster files", type = "message")
   })
-  
-  # ---------------------------------------------------------------------------
-  # Tab 3: Collect form data
-  # ---------------------------------------------------------------------------
-  
+
+  # --------------------------------------------------------------------------
+  # Tab 3 — load ET_white from white reference HDR
+  # --------------------------------------------------------------------------
+
+  observeEvent(input$load_white, {
+    req(white_hdr_path())
+    hdr <- parse_hdr(white_hdr_path())
+    if (!is.null(hdr) && !is.na(hdr$tint)) {
+      updateNumericInput(session, "et_white", value = round(hdr$tint, 3))
+      showNotification("ET_white loaded from white reference .hdr", type = "message")
+    } else {
+      showNotification("Could not read tint from white reference .hdr", type = "warning")
+    }
+  })
+
+  # --------------------------------------------------------------------------
+  # Tab 3 — collect form data
+  # --------------------------------------------------------------------------
+
   collect_form_data <- reactive({
     list(
-      site_name = input$site_name %||% "",
-      site_code = input$site_code %||% "",
-      country = input$country %||% "",
-      country_code = input$country_code %||% "",
-      core_id = input$core_id %||% "",
-      section_depth = input$section_depth %||% "",
-      section_number = input$section_number %||% NA,
-      material_type = input$material_type %||% "",
-      material_owner = input$material_owner %||% "",
-      operator = input$operator %||% "",
-      camera = input$camera %||% "",
-      scan_date = as.character(input$scan_date) %||% "",
-      scan_time = input$scan_time %||% "",
-      scan_start = input$log_scan_start %||% NA,
-      scan_end = input$log_scan_end %||% NA,
-      fov = input$log_fov %||% NA,
-      spectral_binning = input$log_spectral_bin %||% NA,
-      spatial_binning = input$log_spatial_bin %||% NA,
-      integration_time = input$log_tint %||% NA,
-      frame_rate = input$log_fps %||% NA,
-      additional_whiteref = input$additional_whiteref %||% "no",
-      whiteref_exposure = if (input$additional_whiteref == "yes") input$whiteref_exposure else NA,
-      pixel_resolution = input$log_pixel_res %||% NA,
-      aspect_ratio = input$log_aspect_ratio %||% NA,
-      total_lines = input$log_total_lines %||% NA,
-      dropped_frames = input$log_dropped_frames %||% NA,
-      project = input$project %||% "",
-      filename = input$log_filename %||% "",
-      comments = input$comments %||% ""
+      session_id       = input$session_id       %||% "",
+      operator         = input$operator         %||% "",
+      campaign_prefix  = input$campaign_prefix  %||% "",
+      dataset_name     = input$dataset_name     %||% "",
+      scan_date        = as.character(input$scan_date),
+      camera           = input$camera           %||% "",
+      lens             = input$lens             %||% "",
+      calibration_pack = input$calibration_pack %||% "",
+      et_target        = input$et_target,
+      et_white         = input$et_white,
+      fov              = input$log_fov,
+      spectral_binning = input$spectral_binning,
+      spatial_binning  = input$spatial_binning,
+      target_start     = input$target_start,
+      target_stop      = input$target_stop,
+      test_scan_start  = input$test_scan_start,
+      test_scan_stop   = input$test_scan_stop,
+      aspect_ratio     = input$log_aspect_ratio,
+      total_lines      = input$log_total_lines,
+      dropped_frames   = input$log_dropped_frames,
+      saturation_ratio = input$saturation_ratio,
+      gcp_pins         = input$gcp_pins,
+      core_id          = input$core_id          %||% "",
+      section_depth    = input$section_depth    %||% "",
+      material_type    = input$material_type    %||% "",
+      material_owner   = input$material_owner   %||% "",
+      site_name        = input$site_name        %||% "",
+      site_code        = input$site_code        %||% "",
+      country          = input$country          %||% "",
+      filename         = input$log_filename     %||% "",
+      notes            = input$notes            %||% ""
     )
   })
-  
-  # ---------------------------------------------------------------------------
-  # Tab 3: Save functions
-  # ---------------------------------------------------------------------------
-  
-  save_individual_file <- function() {
+
+  # --------------------------------------------------------------------------
+  # Tab 3 — save functions
+  # --------------------------------------------------------------------------
+
+  save_yaml <- function() {
     dir <- selected_save_dir()
     if (is.null(dir)) {
-      showNotification("Please select a folder first", type = "error")
+      showNotification("Please select a save folder first", type = "error")
       return(FALSE)
     }
-    
-    data <- collect_form_data()
-    yaml_content <- generate_yaml(data)
-    
-    base_name <- if (data$filename != "") {
-      tools::file_path_sans_ext(data$filename)
-    } else {
-      format(Sys.time(), "%Y%m%d_%H%M%S")
-    }
-    
-    file_path <- file.path(dir, paste0(base_name, "_scanlog.yaml"))
-    
+    d    <- collect_form_data()
+    base <- if (d$filename != "") tools::file_path_sans_ext(d$filename)
+            else format(Sys.time(), "%Y%m%d_%H%M%S")
+    out  <- file.path(dir, paste0(base, "_scanlog.yaml"))
     tryCatch({
-      writeLines(yaml_content, file_path)
-      showNotification(paste("Saved:", basename(file_path)), type = "message")
+      writeLines(generate_yaml(d), out)
+      showNotification(paste("Saved:", basename(out)), type = "message")
       TRUE
     }, error = \(e) {
-      showNotification(paste("Error saving:", e$message), type = "error")
+      showNotification(paste("Error saving YAML:", e$message), type = "error")
       FALSE
     })
   }
-  
-  save_to_master <- function() {
-    data <- collect_form_data()
-    row <- generate_csv_row(data)
-    
-    master_path <- file.path(getwd(), "hsical_master_log.csv")
-    
+
+  save_csv <- function() {
+    d      <- collect_form_data()
+    master <- file.path(getwd(), "hsical_master_log.csv")
+    row    <- generate_csv_row(d)
     tryCatch({
-      if (file.exists(master_path)) {
-        write.table(row, master_path, append = TRUE, sep = ",",
+      if (file.exists(master)) {
+        write.table(row, master, append = TRUE, sep = ",",
                     row.names = FALSE, col.names = FALSE, quote = TRUE)
       } else {
-        write.csv(row, master_path, row.names = FALSE, quote = TRUE)
+        write.csv(row, master, row.names = FALSE, quote = TRUE)
       }
-      showNotification(paste("Appended to master log:", master_path), type = "message")
+      showNotification(paste("Appended to:", master), type = "message")
       TRUE
     }, error = \(e) {
-      showNotification(paste("Error saving to master:", e$message), type = "error")
+      showNotification(paste("Error saving CSV:", e$message), type = "error")
       FALSE
     })
   }
-  
-  observeEvent(input$save_individual, { save_individual_file() })
-  observeEvent(input$save_master, { save_to_master() })
-  observeEvent(input$save_both, {
-    save_individual_file()
-    save_to_master()
-  })
+
+  observeEvent(input$save_individual, save_yaml())
+  observeEvent(input$save_master,     save_csv())
+  observeEvent(input$save_both,       { save_yaml(); save_csv() })
 }
 
 # ============================================================================
