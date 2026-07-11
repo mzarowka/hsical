@@ -1,14 +1,17 @@
 Package: hsical
 Title: Hyperspectral Image Calibration Tool
-Version: 1.0.0
-Authors@R: 
-    person("Maurycy", "Żarczyński", , email = "maurycy.zarczynski@ug.edu.pl", role = c("aut", "cre"))
-Description: A Shiny application for calculating pixel resolution from
-    hyperspectral test scans. Determines pixel dimensions from motor positions
-    and field-of-view settings, checks for square pixel geometry using a
-    three-tier aspect ratio indicator, calculates the ideal FOV for square
-    pixels, and provides comprehensive scan logging with structured YAML
-    export for downstream processing in HSItools and Quarto.
+Version: 2.0.0
+Authors@R: c(
+    person("Maurycy", "Żarczyński", , email = "maurycy.zarczynski@ug.edu.pl", role = c("aut", "cre")),
+    person("Claude", role = "ctb", comment = "Anthropic; two-mode v2.0 rebuild"))
+Description: A Shiny companion for single-core hyperspectral scanning. In
+    Calibrate mode it derives the ideal field of view and pixel geometry from
+    motor positions and scan dimensions and checks square-pixel aspect ratio
+    with a three-tier indicator. In Log mode it records per-capture metadata by
+    collecting operator input and ENVI .hdr/.log values into an HSItools
+    metadata sidecar, with a Review panel to read sidecars back. hsical owns no
+    schema of its own; sidecar structure, serialization, and validation belong
+    to HSItools.
 License: MIT + file LICENSE
 Encoding: UTF-8
 Roxygen: list(markdown = TRUE)
@@ -18,9 +21,8 @@ Imports:
     bslib,
     bsicons,
     shinyFiles,
-    shinyjs,
-    terra,
-    measurements,
     purrr,
-    yaml,
-    jsonlite
+    cli,
+    HSItools
+Remotes:
+    mzarowka/HSItools@dev
