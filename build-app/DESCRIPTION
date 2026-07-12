@@ -1,0 +1,10 @@
+Package: hsicalapp
+Version: 2.0.0
+Imports:
+    shiny,
+    bslib,
+    bsicons,
+    shinyFiles,
+    purrr,
+    HSItools
+Remotes: mzarowka/HSItools

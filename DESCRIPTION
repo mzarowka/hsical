@@ -15,7 +15,6 @@ Description: A Shiny companion for single-core hyperspectral scanning. In
 License: MIT + file LICENSE
 Encoding: UTF-8
 Roxygen: list(markdown = TRUE)
-RoxygenNote: 7.3.1
 Imports:
     shiny,
     bslib,
@@ -25,4 +24,5 @@ Imports:
     cli,
     HSItools
 Remotes:
-    mzarowka/HSItools@dev
+    mzarowka/HSItools
+Config/roxygen2/version: 8.0.0
