@@ -199,15 +199,15 @@ ratio_tier <- function(ratio) {
 }
 
 # Fields stable across a scanning session: carried between saves, blanked by
-# "Clear session". Split by input type so updates use the right fn. sensor_type
-# is session-stable too but a selectize — handled separately.
+# "Clear session". Split by input type so updates use the right fn. Three more
+# session-stable fields are handled separately in the clear: sensor_type and
+# lens are selectizes, and manufacturer resets to its "Specim" default rather
+# than to blank.
 SESSION_TEXT <- c(
   "session_id",
   "operator",
   "campaign_prefix",
   "dataset_name",
-  "manufacturer",
-  "lens",
   "calibration_pack"
 )
 SESSION_NUMERIC <- c(
@@ -236,6 +236,20 @@ PER_CAPTURE_NUMERIC <- c(
   "dropped_frames",
   "gcp_count"
 )
+shot
+# Review-editor field typing. Every numeric sidecar field, reused from the Scan
+# form's own lists plus the three derived values (xres/yres/aspect_ratio) that
+# are never typed there; anything else scalar is text. wavelengths/fwhm are
+# vectors and schema_version is a protocol invariant, so all three are shown
+# read-only and carried through a save untouched.
+REVIEW_NUMERIC <- c(
+  SESSION_NUMERIC,
+  PER_CAPTURE_NUMERIC,
+  "xres",
+  "yres",
+  "aspect_ratio"
+)
+REVIEW_READONLY <- c("schema_version", "wavelengths", "fwhm")
 
 # Blank -> NULL: hsi_create_metadata() wants NULL for absent fields, never "" or NA
 # (a blank numericInput returns logical NA, so test is.na() before type).
@@ -347,6 +361,10 @@ ui <- bslib::page_navbar(
                   shiny::textOutput("out_length", inline = TRUE)
                 ),
                 shiny::div(
+                  shiny::strong("Est. scan time: "),
+                  shiny::textOutput("out_scan_time", inline = TRUE)
+                ),
+                shiny::div(
                   shiny::strong("yres (along-track): "),
                   shiny::textOutput("out_yres", inline = TRUE)
                 ),
@@ -378,7 +396,7 @@ ui <- bslib::page_navbar(
           "Session",
           icon = bsicons::bs_icon("collection"),
           bslib::layout_columns(
-            col_widths = c(6, 6),
+            col_widths = bslib::breakpoints(sm = 6, lg = 3),
             shiny::textInput(
               "session_id",
               tip(
@@ -405,7 +423,7 @@ ui <- bslib::page_navbar(
           "Instrument",
           icon = bsicons::bs_icon("camera"),
           bslib::layout_columns(
-            col_widths = c(6, 6),
+            col_widths = bslib::breakpoints(sm = 6, lg = 3),
             shiny::selectizeInput(
               "sensor_type",
               tip("Sensor type", "VNIR / SWIR, or type a custom value."),
@@ -418,11 +436,22 @@ ui <- bslib::page_navbar(
             ),
             shiny::textInput(
               "manufacturer",
-              tip("Manufacturer", "e.g. Specim.")
+              tip("Manufacturer", "Defaults to Specim, the rig this app targets."),
+              value = "Specim"
             ),
-            shiny::textInput(
+            shiny::selectizeInput(
               "lens",
-              tip("Lens", "Free text, e.g. 18.5 mm.")
+              tip("Lens", "Specim objective. Pick one, or type a custom value."),
+              # SWIR objectives are OLES30 / OLESmacro. The two VNIR entries are
+              # placeholders — replace with the real Specim VNIR lens names.
+              choices = c(
+                "OLES30",
+                "OLESmacro",
+                "VNIR lens 1 (TODO)",
+                "VNIR lens 2 (TODO)"
+              ),
+              selected = character(0),
+              options = list(create = TRUE, placeholder = "Select or type a lens")
             ),
             shiny::textInput(
               "calibration_pack",
@@ -435,7 +464,7 @@ ui <- bslib::page_navbar(
           "Acquisition",
           icon = bsicons::bs_icon("grid-3x3"),
           bslib::layout_columns(
-            col_widths = c(4, 4, 4),
+            col_widths = bslib::breakpoints(sm = 6, lg = 3),
             shiny::numericInput(
               "et_target_ms",
               tip("ET target (ms)", "From the capture .hdr `tint`."),
@@ -510,23 +539,29 @@ ui <- bslib::page_navbar(
       ),
       bslib::card_footer(
         shiny::div(
-          class = "d-flex flex-column gap-2",
-          shiny::div(
-            class = "d-flex align-items-center gap-2 flex-wrap",
-            shinyFiles::shinyDirButton(
-              "save_dir_btn",
-              "Folder\u2026",
-              "Select save folder",
-              icon = bsicons::bs_icon("folder")
-            ),
-            shiny::span(
-              shiny::strong("Save to: "),
-              shiny::textOutput("save_target", inline = TRUE)
-            ),
-            shiny::checkboxInput("overwrite", "Overwrite", value = FALSE)
+          class = "d-flex align-items-center gap-2 flex-wrap",
+          shinyFiles::shinyDirButton(
+            "save_dir_btn",
+            "Folder\u2026",
+            "Select save folder",
+            icon = bsicons::bs_icon("folder")
           ),
+          shiny::span(
+            shiny::strong("Save to: "),
+            shiny::textOutput("save_target", inline = TRUE)
+          ),
+          # checkboxInput's root is its .shiny-input-container, which carries a
+          # bottom margin; mb-0 on that root drops it so the box sits on the
+          # row's centre line with the buttons instead of nudging the row taller.
+          htmltools::tagAppendAttributes(
+            shiny::checkboxInput("overwrite", "Overwrite", value = FALSE),
+            class = "mb-0"
+          ),
+          # ms-auto pushes the actions to the far right; the left cluster keeps
+          # its natural width. flex-wrap drops them to a second line only when
+          # the card is too narrow to hold everything.
           shiny::div(
-            class = "d-flex gap-2",
+            class = "d-flex gap-2 ms-auto",
             shiny::actionButton(
               "save",
               "Save sidecar",
@@ -549,16 +584,32 @@ ui <- bslib::page_navbar(
     title = "Review",
     bslib::card(
       bslib::card_header(
-        shinyFiles::shinyFilesButton(
-          "review_yaml",
-          "Load sidecar",
-          "Select a .yaml sidecar",
-          multiple = FALSE,
-          icon = bsicons::bs_icon("file-earmark-text")
+        shiny::div(
+          class = "d-flex gap-3 flex-wrap align-items-center",
+          shinyFiles::shinyFilesButton(
+            "review_yaml",
+            "Load sidecar",
+            "Select a .yaml sidecar",
+            multiple = FALSE,
+            icon = bsicons::bs_icon("file-earmark-text")
+          ),
+          shiny::span(
+            class = "small",
+            shiny::strong("Editing: "),
+            shiny::textOutput("review_path_label", inline = TRUE)
+          )
         )
       ),
       bslib::card_body(
-        shiny::tableOutput("review_table")
+        shiny::uiOutput("review_editor")
+      ),
+      bslib::card_footer(
+        shiny::actionButton(
+          "review_save",
+          "Save changes",
+          icon = bsicons::bs_icon("save"),
+          class = "btn-primary"
+        )
       )
     )
   )
@@ -582,8 +633,10 @@ server <- function(input, output, session) {
   # holds the .hdr), overridable via the Folder… button.
   save_dir <- shiny::reactiveVal(NULL)
 
-  # Sidecar loaded into the Review panel (read-only).
+  # Sidecar loaded into the Review panel: the hsi_metadata object and the path
+  # it came from. The object is edited in place and written back to the path.
   review_md <- shiny::reactiveVal(NULL)
+  review_path <- shiny::reactiveVal(NULL)
 
   shinyFiles::shinyFileChoose(
     input,
@@ -610,9 +663,18 @@ server <- function(input, output, session) {
     fov <- nz(input$fov_mm)
     lines <- nz(input$nrow)
     samples <- nz(input$ncol)
+    speed <- nz(input$scanning_speed_mm_s)
 
     length_mm <- if (!is.null(start) && !is.null(stop) && stop > start) {
       stop - start
+    } else {
+      NA_real_
+    }
+
+    # Along-track traverse time: how long the stage takes to cover the scan at
+    # the set speed. A pre-scan sanity check, and a post-hoc read of duration.
+    scan_time_s <- if (!is.na(length_mm) && !is.null(speed) && speed > 0) {
+      length_mm / speed
     } else {
       NA_real_
     }
@@ -640,12 +702,25 @@ server <- function(input, output, session) {
         yres * samples / 1000
       } else {
         NA_real_
-      }
+      },
+      scan_time_s = scan_time_s
     )
   })
 
   fmt_num <- function(v, digits, unit) {
     if (is.na(v)) "\u2014" else paste(round(v, digits), unit)
+  }
+
+  # Duration as "45 s" or "3 min 07 s".
+  fmt_time <- function(s) {
+    if (is.na(s)) {
+      return("\u2014")
+    }
+    s <- round(s)
+    if (s < 60) {
+      return(paste0(s, " s"))
+    }
+    sprintf("%d min %02d s", s %/% 60, s %% 60)
   }
 
   output$out_length <- shiny::renderText(
@@ -659,6 +734,9 @@ server <- function(input, output, session) {
   )
   output$out_ideal_fov <- shiny::renderText(
     fmt_num(geom()$ideal_fov_mm, 3, "mm")
+  )
+  output$out_scan_time <- shiny::renderText(
+    fmt_time(geom()$scan_time_s)
   )
 
   output$out_ratio_box <- shiny::renderUI({
@@ -917,17 +995,18 @@ server <- function(input, output, session) {
       shiny::updateNumericInput(session, id, value = NA)
     })
     shiny::updateSelectizeInput(session, "sensor_type", selected = character(0))
+    shiny::updateSelectizeInput(session, "lens", selected = character(0))
+    shiny::updateTextInput(session, "manufacturer", value = "Specim")
   })
 
-  # ---- Review: read one sidecar back (read-only) ------------------------
+  # ---- Review: read one sidecar back, edit it, write it in place --------
   shiny::observeEvent(input$review_yaml, {
     fi <- shinyFiles::parseFilePaths(volumes, input$review_yaml)
     if (nrow(fi) == 0) {
       return()
     }
-    md <- tryCatch(HSItools::hsi_read_metadata(fi$datapath[[1]]), error = \(e) {
-      e
-    })
+    path <- fi$datapath[[1]]
+    md <- tryCatch(HSItools::hsi_read_metadata(path), error = \(e) e)
     if (inherits(md, "error")) {
       shiny::showNotification(
         conditionMessage(md),
@@ -935,42 +1014,89 @@ server <- function(input, output, session) {
         duration = NULL
       )
       review_md(NULL)
+      review_path(NULL)
       return()
     }
     review_md(md)
+    review_path(path)
   })
 
-  output$review_table <- shiny::renderTable(
-    {
-      md <- review_md()
-      if (is.null(md)) {
-        return(NULL)
-      }
-      fmt <- \(v) {
-        if (is.null(v) || length(v) == 0) {
-          return("\u2014")
+  output$review_path_label <- shiny::renderText({
+    review_path() %||% "no sidecar loaded"
+  })
+
+  # One editable input per scalar field, typed from REVIEW_NUMERIC; vectors and
+  # schema_version are read-only summaries. Fields absent from the sidecar still
+  # render (as NA/blank), so a value forgotten at save time can be added here.
+  output$review_editor <- shiny::renderUI({
+    md <- review_md()
+    if (is.null(md)) {
+      return(shiny::span(class = "text-muted", "No sidecar loaded."))
+    }
+    field_ui <- function(f) {
+      v <- md[[f]]
+      id <- paste0("rev_", f)
+      if (f %in% REVIEW_READONLY) {
+        summary <- if (is.null(v) || length(v) == 0) {
+          "\u2014"
+        } else if (length(v) > 1) {
+          sprintf("%d values, %s\u2013%s", length(v), format(min(v)), format(max(v)))
+        } else {
+          as.character(v)
         }
-        if (length(v) > 1) {
-          return(sprintf(
-            "%d values, %s\u2013%s",
-            length(v),
-            format(min(v)),
-            format(max(v))
-          ))
-        }
-        as.character(v)
+        return(shiny::div(
+          class = "text-muted small",
+          shiny::strong(f),
+          ": ",
+          summary
+        ))
       }
-      data.frame(
-        Field = names(md),
-        Value = purrr::map_chr(md, fmt),
-        stringsAsFactors = FALSE,
-        check.names = FALSE
+      if (f %in% REVIEW_NUMERIC) {
+        shiny::numericInput(id, f, value = if (is.null(v)) NA else v)
+      } else {
+        shiny::textInput(id, f, value = if (is.null(v)) "" else as.character(v))
+      }
+    }
+    do.call(
+      bslib::layout_column_wrap,
+      c(list(width = 1 / 4), purrr::map(names(md), field_ui))
+    )
+  })
+
+  # Save: fold each edited scalar back into the loaded object (blank -> absent),
+  # leaving schema_version and the spectral vectors as read. HSItools validates
+  # on write, so an out-of-range edit aborts with its own message.
+  shiny::observeEvent(input$review_save, {
+    md <- review_md()
+    path <- review_path()
+    if (is.null(md) || is.null(path)) {
+      shiny::showNotification(
+        "Load a sidecar before saving.",
+        type = "warning"
       )
-    },
-    striped = TRUE,
-    spacing = "xs",
-    width = "100%"
-  )
+      return()
+    }
+    for (f in names(md)) {
+      if (f %in% REVIEW_READONLY) {
+        next
+      }
+      md[f] <- list(nz(input[[paste0("rev_", f)]]))
+    }
+    res <- tryCatch(
+      HSItools::hsi_write_metadata(md, filename = path, overwrite = TRUE),
+      error = \(e) e
+    )
+    if (inherits(res, "error")) {
+      shiny::showNotification(
+        conditionMessage(res),
+        type = "error",
+        duration = NULL
+      )
+    } else {
+      shiny::showNotification(paste("Saved", path), type = "message")
+      review_md(md)
+    }
+  })
 }
 
 shiny::shinyApp(ui, server)

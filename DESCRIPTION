@@ -11,7 +11,8 @@ Description: A Shiny companion for hyperspectral scanning sessions. It treats
     and raster dimensions yield the along- and across-track pixel sizes, the
     aspect ratio, and the field of view that would square the pixels. Those
     derived values, together with operator input and header values, are written
-    to an HSItools metadata sidecar, with a Review panel to read sidecars back.
+    to an HSItools metadata sidecar, with a Review panel to read sidecars back
+    and correct them in place.
     hsical owns no schema of its own; sidecar structure, serialization, and
     validation belong to HSItools.
 License: MIT + file LICENSE
