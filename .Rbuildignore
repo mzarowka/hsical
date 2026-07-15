@@ -1,3 +1,8 @@
 ^LICENSE\.md$
 ^README\.md$
 ^\.gitignore$
+^CLAUDE\.md$
+^dev-notes$
+^\.claude$
+^[.]?air[.]toml$
+^\.vscode$
