@@ -236,7 +236,7 @@ PER_CAPTURE_NUMERIC <- c(
   "dropped_frames",
   "gcp_count"
 )
-shot
+
 # Review-editor field typing. Every numeric sidecar field, reused from the Scan
 # form's own lists plus the three derived values (xres/yres/aspect_ratio) that
 # are never typed there; anything else scalar is text. wavelengths/fwhm are
