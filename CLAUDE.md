@@ -74,11 +74,12 @@ scan time — is **derived** in `geom()`, never typed. v2.1 collapsed the old sp
 one Scan panel + a Review panel; "test", "confirmation" and "target" scans were never
 different objects, only different things to look at. Don't reintroduce separate cards.
 
-> Note: the interface contract (v3.0, 2026-07-11) still describes a two-mode
-> Calibrate|Log app; the app (v2.1, 2026-07-14) has since collapsed to one Scan panel
-> + Review. The core contract (own no schema, wrap the trio, flat sidecar) is intact,
-> but the doc's app-structure section lags the code — flag to Maury rather than trusting
-> it for layout.
+> The interface contract was reconciled to this structure in **v3.1 (2026-07-15)**:
+> one Scan panel + Review, with `xres`/`yres`/`aspect_ratio` derived, not typed. This is
+> the tool's whole purpose — scan length from the motor positions divided by raster
+> dimensions *is* the pixel size (`yres = length·1000/nrow`, `xres = fov·1000/ncol`);
+> a nominal typed value was never the intent. Ratified 2026-07-15; don't reintroduce
+> manual xres/yres inputs.
 
 ## Code style (ecosystem §2 — house style, non-negotiable)
 

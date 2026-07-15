@@ -40,13 +40,16 @@ restates only what a hsical-only session needs.
   DLLs); run R via PowerShell's `Rscript.exe`. To read a compiled function without
   attaching: `deparse(get(f, asNamespace("HSItools")))`.
 
-## Open items for Maury
+## Follow-ups
 
-- **Interface contract lags the code.** `hsi-interface-contract.md` (v3.0) still
-  describes a two-mode Calibrate|Log app; hsical v2.1 collapsed to one Scan panel +
-  Review. Core contract (own no schema, wrap the trio, flat sidecar) is intact, but the
-  doc's app-structure section is stale. Contract edits belong to Maury — flagged, not
-  fixed.
+- **Interface contract reconciled → v3.1 (2026-07-15).** On Maury's go-ahead,
+  `hsi-interface-contract.md` was amended: two-mode Calibrate|Log → one Scan panel +
+  Review; `xres`/`yres`/`aspect_ratio` documented as derived; Review noted as
+  single-sidecar edit-in-place (directory session-table = future). Schema 1.1.0 and
+  protocol 2.0 untouched. **Ratified 2026-07-15:** `xres`/`yres` are derived, not
+  manual — deriving pixel size from scan length (motor positions) ÷ raster dimensions
+  is the tool's whole purpose; a typed nominal was never the intent. Contract 3.0's
+  "manual" framing is superseded. Don't reintroduce manual xres/yres inputs.
 - **`README.md` refreshed** this session (was pre-2.0 three-tab app with dead deps).
 
 ## Standing v2.1 observations (context, not tasks)
