@@ -32,8 +32,9 @@ From ecosystem §0/§9. They apply to hsical work:
    show output before claiming success; otherwise hand off patches for Maury to run.
    Never claim a verification step ran unless its output was shown.
 6. **CLAUDE.md carries durable conventions only.** No milestone state, session notes,
-   TODOs, or roadmap here — those live in dated `dev-notes/YYYY-MM-DD_<topic>.md`
-   documents (see "Dev-notes convention" below). Don't edit this file unless asked.
+   TODOs, or roadmap here — those live in dated `YYYY-MM-DD_<topic>.md` documents in
+   the private `hsi_development` repo, folder `hsical/` (see "Dev-notes convention"
+   below). Don't edit this file unless asked.
 
 ## The one architectural rule: hsical owns no schema
 
@@ -42,7 +43,8 @@ The sidecar's schema, YAML serialization, and validation belong to **HSItools**.
 piped to `hsi_write_metadata()` / `hsi_read_metadata()`. **If hsical code ever contains
 `yaml::` or a field list of its own, the design has been violated.**
 
-**Authoritative spec:** `C:\GitHub\HSItools\dev-notes\hsi-interface-contract.md`
+**Authoritative spec:** `hsi-interface-contract.md` in the private `hsi_development`
+repo (folder `hsitools/`)
 (contract v3.0, schema v1.1.0) — the human-readable field→GUI-source map and the list
 of deliberately-rejected fields. The normative field types/ranges live in HSItools'
 `validate_hsi_metadata()`. **Do not restate the 32-field schema here** — read the
@@ -102,15 +104,17 @@ Match `app.R`:
   `REVIEW_*`), UI, server. No business logic lives outside this file.
 - `R/run_app.R` — thin `shiny::runApp(system.file("app", package="hsical"))` wrapper.
 - `inst/launch/` — Windows launcher (`hsical.cmd`, shortcut installer).
-- `dev-notes/` — design notes (not shipped). HSItools is a GitHub dep
-  (`Remotes: mzarowka/HSItools`), not on CRAN.
+- HSItools is a GitHub dep (`Remotes: mzarowka/HSItools`), not on CRAN. Design
+  notes live in the private `hsi_development` repo, not in this one.
 
 ## Dev-notes convention
 
-Ecosystem style is **dated documents**: `dev-notes/YYYY-MM-DD_<topic>.md` for handoffs,
-memos, and audits, plus stable-name reference docs (e.g. HSItools'
-`hsi-interface-contract.md`). Durable conventions go in CLAUDE.md; everything time-bound
-goes in dated dev-notes — never in CLAUDE.md.
+Ecosystem style is **dated documents**: `YYYY-MM-DD_<topic>.md` for handoffs, memos,
+and audits, plus stable-name reference docs (e.g. `hsi-interface-contract.md`). As of
+2026-07-18 all of these live in the **private `hsi_development` repo**, one folder per
+package (`hsitools/`, `zarowka/`, `hsical/`) — never inside the package repos, whose
+`dev-notes/` ignore entries remain only as a safety net. Durable conventions go in
+CLAUDE.md; everything time-bound goes in dated docs — never in CLAUDE.md.
 
 ## Running & gotchas
 
