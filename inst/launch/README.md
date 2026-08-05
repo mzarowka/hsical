@@ -9,7 +9,7 @@ clean browser window — no tabs, no address bar, no menus.
 - **hsical** installed into that R, so `hsical::run_app()` works:
   ```r
   # install.packages("remotes")
-  remotes::install_github("<your-org>/hsical")   # or install from a local copy
+  remotes::install_github("mzarowka/hsical")   # or install from a local copy
   ```
 - **Microsoft Edge** or **Google Chrome** (either; Edge ships with Windows 11).
   Without one, it falls back to the default browser — which *will* show tabs.
