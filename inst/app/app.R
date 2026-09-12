@@ -98,6 +98,22 @@ parse_hdr <- function(hdr_path) {
   cal_raw <- xval("(?<=calibration pack = )[^\n]+")
   cal <- if (!is.na(cal_raw)) trimws(cal_raw) else NA_character_
 
+  # The pack file name carries the objective, but not at a fixed position: the
+  # VNIR packs run it into the word (560025_20211124_OLE18.5calpack.scp) while
+  # the SWIR ones set it off with underscores and precede "calpack" with one
+  # (472194_OLES30_20250422_calpack_BPR.scp). Looking for the known names is
+  # therefore sounder than looking at a position; longest match wins so a short
+  # name nested in a longer one cannot win. The lens is unrecorded anywhere else
+  # in the header, and leaving the operator to remember it is how a VNIR scan
+  # ends up logged with a SWIR objective.
+  lens <- if (is.na(cal)) {
+    NA_character_
+  } else {
+    known <- setdiff(LENS_CHOICES, "")
+    hits <- known[purrr::map_lgl(known, \(i) grepl(i, cal, fixed = TRUE))]
+    if (length(hits) == 0) NA_character_ else hits[[which.max(nchar(hits))]]
+  }
+
   list(
     lines = xnum("lines"),
     samples = xnum("samples"),
@@ -108,6 +124,7 @@ parse_hdr <- function(hdr_path) {
     spatial_binning = spat_bin,
     camera = camera,
     calibration_pack = cal,
+    lens = lens,
     acquisition_date = xval(
       "(?<=acquisition date = DATE\\(yyyy-mm-dd\\): )[0-9-]+"
     ),
@@ -160,8 +177,17 @@ discover_capture <- function(hdr_path) {
   capture_dir <- dirname(hdr_path)
   scan_root <- dirname(capture_dir)
 
-  log_path <- find_one(capture_dir, "\\.log$") %||%
-    find_one(scan_root, "\\.log$")
+  # The log is matched by the capture's own name, beside it or one level up. A
+  # bare ".log$" search returns the alphabetically first hit, and a Lumo capture
+  # folder holds three logs — the DARKREF one sorts ahead of the scan, so the
+  # dropped-frame count logged would be the dark reference's. Finding nothing is
+  # the better failure: the field stays empty instead of quietly wrong.
+  log_name <- paste0(tools::file_path_sans_ext(basename(hdr_path)), ".log")
+
+  log_path <- purrr::detect(
+    file.path(c(capture_dir, scan_root), log_name),
+    file.exists
+  )
 
   list(
     target = hdr_path,
@@ -170,6 +196,80 @@ discover_capture <- function(hdr_path) {
     log = log_path,
     scan_root = scan_root
   )
+}
+
+# terra refuses an ENVI .hdr path outright ("the data file should be selected
+# instead"), so every raster read goes through the binary sibling. Lumo writes
+# .raw; the fallback covers a vendor writing the same stem under another
+# extension. NULL when nothing sits beside the header.
+envi_data <- function(hdr_path) {
+  candidate <- sub("\\.hdr$", ".raw", hdr_path, ignore.case = TRUE)
+  if (file.exists(candidate)) {
+    return(candidate)
+  }
+
+  stem <- tools::file_path_sans_ext(basename(hdr_path))
+  siblings <- list.files(dirname(hdr_path), full.names = TRUE)
+  hits <- siblings[
+    tools::file_path_sans_ext(basename(siblings)) == stem &
+      !grepl("\\.(hdr|log)$", siblings, ignore.case = TRUE)
+  ]
+
+  if (length(hits) == 0) NULL else hits[[1]]
+}
+
+# The composites HSItools::hsi_calc_preview() offers, resolved here against the
+# header wavelengths: the screening preview is raw DN with no references, so
+# hsi_calc_preview() itself — which calibrates to reflectance — does not apply.
+PREVIEW_COMPOSITES <- list(RGB = c(650, 550, 450), SWIR = c(1650, 1100, 2200))
+
+# Screening every Nth band costs proportionally less time and undercounts only
+# slightly: a clipped pixel clips across dozens of neighbouring bands, so any of
+# these steps still lands inside almost every run. Measured on a sparsely
+# saturated GKUT VNIR region (0.4794% of pixels), a step of 8 recovered 97.5% of
+# the count in an eighth of the time, and a step of 32 still recovered 96.2%.
+# The result is always a lower bound — a subset can miss a saturated pixel but
+# never invent one.
+BAND_STEPS <- c(
+  "all" = "1",
+  "2nd" = "2",
+  "4th" = "4",
+  "8th" = "8",
+  "16th" = "16"
+)
+
+# Specim objectives: OL50 and OLE18.5 on the VNIR camera, OLES30 and OLESmacro
+# on the SWIR. The leading blank keeps the field empty until something fills it.
+LENS_CHOICES <- c("", "OL50", "OLE18.5", "OLES30", "OLESmacro")
+
+# Both cameras are 16-bit. The screen limit is a percentage of this ceiling
+# rather than the ceiling itself: detector response compresses before it clips,
+# so an exact-ceiling test understates the damaged region.
+SATURATION_CEILING <- 65535
+
+# Brush rectangle -> a terra extent on the capture grid, or NULL for full frame.
+# The preview is drawn with the long axis horizontal, so display x is the line
+# index and display y the sample index, sample 1 at the top. terra's grid for an
+# extent-less raster is the other way round — x is the sample, y is the line
+# counted up from the last one — hence the swap and the flip.
+brush_window <- function(brush, n_line, n_sample) {
+  if (is.null(brush)) {
+    return(NULL)
+  }
+
+  clamp <- \(v, hi) min(max(v, 0), hi)
+
+  x_min <- clamp(brush[["ymin"]], n_sample)
+  x_max <- clamp(brush[["ymax"]], n_sample)
+  y_min <- n_line - clamp(brush[["xmax"]], n_line)
+  y_max <- n_line - clamp(brush[["xmin"]], n_line)
+
+  # A click rather than a drag leaves no area to window.
+  if (x_max - x_min < 1 || y_max - y_min < 1) {
+    return(NULL)
+  }
+
+  terra::ext(x_min, x_max, y_min, y_max)
 }
 
 # Three-tier aspect ratio classification -> list(theme, icon, label)
@@ -276,6 +376,12 @@ nz <- function(v) {
 ui <- bslib::page_navbar(
   title = "hsical",
   theme = bslib::bs_theme(version = 5, primary = "#2c6e8f"),
+
+  # Only the screening panel fills the window: its preview is the one thing that
+  # gets more useful with more height, since picking a region of interest across
+  # track means resolving the tape edge. The form panels keep their natural
+  # height and scroll.
+  fillable = "Saturation",
 
   bslib::nav_panel(
     title = "Scan",
@@ -436,22 +542,27 @@ ui <- bslib::page_navbar(
             ),
             shiny::textInput(
               "manufacturer",
-              tip("Manufacturer", "Defaults to Specim, the rig this app targets."),
+              tip(
+                "Manufacturer",
+                "Defaults to Specim, the rig this app targets."
+              ),
               value = "Specim"
             ),
             shiny::selectizeInput(
               "lens",
-              tip("Lens", "Specim objective. Pick one, or type a custom value."),
-              # SWIR objectives are OLES30 / OLESmacro. The two VNIR entries are
-              # placeholders — replace with the real Specim VNIR lens names.
-              choices = c(
-                "OLES30",
-                "OLESmacro",
-                "VNIR lens 1 (TODO)",
-                "VNIR lens 2 (TODO)"
+              tip(
+                "Lens",
+                "Specim objective. Pick one, or type a custom value."
               ),
-              selected = character(0),
-              options = list(create = TRUE, placeholder = "Select or type a lens")
+              choices = LENS_CHOICES,
+              # The empty entry has to exist: with a list of real names and no
+              # blank, selectize adopts the first one, and every untouched save
+              # records a lens nobody chose.
+              selected = "",
+              options = list(
+                create = TRUE,
+                placeholder = "Select or type a lens"
+              )
             ),
             shiny::textInput(
               "calibration_pack",
@@ -604,11 +715,119 @@ ui <- bslib::page_navbar(
         shiny::uiOutput("review_editor")
       ),
       bslib::card_footer(
+        # Nothing to save until a sidecar is read, so the button starts dead and
+        # the load observer wakes it.
         shiny::actionButton(
           "review_save",
           "Save changes",
           icon = bsicons::bs_icon("save"),
-          class = "btn-primary"
+          class = "btn-primary",
+          disabled = TRUE
+        )
+      )
+    )
+  ),
+
+  bslib::nav_panel(
+    title = "Saturation",
+    bslib::card(
+      bslib::card_header(
+        shiny::div(
+          class = "d-flex gap-3 flex-wrap align-items-center",
+          shiny::div(
+            class = "small",
+            shiny::strong("Screening: "),
+            shiny::textOutput("sat_source_label", inline = TRUE)
+          )
+        )
+      ),
+      bslib::card_body(
+        # The preview is the only element that grows with the window; the note
+        # and the verdict keep their natural height.
+        class = "d-flex flex-column",
+        shiny::div(
+          class = "small text-muted mb-2 flex-shrink-0",
+          "Raw digital numbers, no references. Drag on the preview to screen a",
+          "region of interest and keep the tape and tray out of the count;",
+          "release outside the image to screen the full frame. The preview is",
+          "decimated and its aspect ratio is deliberately broken — axes are",
+          "line and sample indices."
+        ),
+        shiny::div(
+          class = "flex-grow-1",
+          style = "min-height: 240px;",
+          shiny::plotOutput(
+            "sat_preview_plot",
+            height = "100%",
+            brush = shiny::brushOpts(id = "sat_brush", resetOnNew = TRUE)
+          )
+        ),
+        # The verdict's slot is reserved whether or not there is a verdict in it:
+        # letting it appear would resize the plot, and a redrawn plot drops the
+        # brush the reader just made.
+        shiny::div(
+          class = "flex-shrink-0 overflow-auto",
+          style = "height: 76px;",
+          shiny::uiOutput("sat_report")
+        )
+      ),
+      bslib::card_footer(
+        shiny::div(
+          class = "d-flex gap-3 flex-wrap align-items-end",
+          # Radios rather than dropdowns: the card fills the window, so its
+          # controls sit against the bottom edge and a dropdown would open into
+          # it. Both lists are short enough to show whole.
+          shiny::div(
+            shiny::radioButtons(
+              "sat_composite",
+              tip(
+                "Preview composite",
+                "Which three raw bands to draw. Display only — it has no bearing on which bands are screened."
+              ),
+              choices = names(PREVIEW_COMPOSITES),
+              selected = "RGB",
+              inline = TRUE
+            )
+          ),
+          shiny::div(
+            shiny::radioButtons(
+              "sat_band_step",
+              tip(
+                "Screen every Nth band",
+                "Reading fewer bands is proportionally faster and can only undercount: clipping runs across dozens of neighbouring bands, so a sampled screen still finds nearly every affected pixel, and every pixel it does find is genuinely saturated."
+              ),
+              choices = BAND_STEPS,
+              selected = "1",
+              inline = TRUE
+            )
+          ),
+          shiny::div(
+            shiny::numericInput(
+              "sat_percent",
+              tip(
+                "Limit (% of full scale)",
+                "A pixel counts as overexposed at or above this share of the 16-bit ceiling. Response compresses before it clips, so the limit sits below 100%."
+              ),
+              value = 97.5,
+              min = 50,
+              max = 100,
+              step = 0.5,
+              width = "180px"
+            )
+          ),
+          shiny::div(
+            class = "small text-muted pb-3",
+            shiny::textOutput("sat_limit_label", inline = TRUE)
+          ),
+          shiny::div(
+            class = "pb-3",
+            shiny::actionButton(
+              "sat_run",
+              "Screen for saturation",
+              icon = bsicons::bs_icon("eyedropper"),
+              class = "btn-primary"
+            )
+          )
         )
       )
     )
@@ -784,6 +1003,16 @@ server <- function(input, output, session) {
         session,
         "calibration_pack",
         value = hdr[["calibration_pack"]]
+      )
+    }
+    # An objective the pack names but the list does not know still has to be
+    # selectable, so it joins the choices rather than being dropped.
+    if (!is.na(hdr[["lens"]])) {
+      shiny::updateSelectizeInput(
+        session,
+        "lens",
+        choices = union(LENS_CHOICES, hdr[["lens"]]),
+        selected = hdr[["lens"]]
       )
     }
     if (!is.na(hdr[["lines"]])) {
@@ -995,7 +1224,12 @@ server <- function(input, output, session) {
       shiny::updateNumericInput(session, id, value = NA)
     })
     shiny::updateSelectizeInput(session, "sensor_type", selected = character(0))
-    shiny::updateSelectizeInput(session, "lens", selected = character(0))
+    shiny::updateSelectizeInput(
+      session,
+      "lens",
+      choices = LENS_CHOICES,
+      selected = ""
+    )
     shiny::updateTextInput(session, "manufacturer", value = "Specim")
   })
 
@@ -1015,10 +1249,12 @@ server <- function(input, output, session) {
       )
       review_md(NULL)
       review_path(NULL)
+      shiny::updateActionButton(session, "review_save", disabled = TRUE)
       return()
     }
     review_md(md)
     review_path(path)
+    shiny::updateActionButton(session, "review_save", disabled = FALSE)
   })
 
   output$review_path_label <- shiny::renderText({
@@ -1040,7 +1276,12 @@ server <- function(input, output, session) {
         summary <- if (is.null(v) || length(v) == 0) {
           "\u2014"
         } else if (length(v) > 1) {
-          sprintf("%d values, %s\u2013%s", length(v), format(min(v)), format(max(v)))
+          sprintf(
+            "%d values, %s\u2013%s",
+            length(v),
+            format(min(v)),
+            format(max(v))
+          )
         } else {
           as.character(v)
         }
@@ -1096,6 +1337,277 @@ server <- function(input, output, session) {
       shiny::showNotification(paste("Saved", path), type = "message")
       review_md(md)
     }
+  })
+
+  # ---- Saturation screening ----------------------------------------------
+  # A screen of the capture already loaded on the Scan panel, and nothing else:
+  # load the core scan to judge the specimen, load the white reference session
+  # scan to judge the reference. The WHITEREF sibling is never screened — Lumo
+  # captures it at the specimen's integration time, so it clips by design.
+
+  output$sat_source_label <- shiny::renderText({
+    cap <- found()
+    if (is.null(cap)) "no scan loaded" else basename(cap[["target"]])
+  })
+
+  output$sat_limit_label <- shiny::renderText({
+    pct <- input$sat_percent
+    if (is.null(pct) || is.na(pct)) {
+      return("")
+    }
+    paste0(
+      "= ",
+      round(SATURATION_CEILING * pct / 100),
+      " DN of ",
+      SATURATION_CEILING
+    )
+  })
+
+  # Full-resolution dimensions of the loaded capture. Opening is lazy, so this
+  # costs a header read.
+  sat_source <- shiny::reactive({
+    cap <- found()
+    shiny::req(cap)
+    path <- envi_data(cap[["target"]])
+    shiny::req(path)
+    terra::rast(path)
+  })
+
+  # Decimated three-band preview. terra pushes the decimation down into the GDAL
+  # read, so this stays under a second even on a 50 GB capture; a full-resolution
+  # three-band read would seek once per line per band through BIL data.
+  sat_preview <- shiny::reactive({
+    cap <- found()
+    shiny::req(cap)
+    wl <- spectral()[["wavelengths"]]
+    shiny::req(length(wl) > 0)
+    path <- envi_data(cap[["target"]])
+    shiny::req(path)
+
+    targets <- PREVIEW_COMPOSITES[[input$sat_composite %||% "RGB"]]
+    idx <- purrr::map_int(targets, \(w) which.min(abs(wl - w)))
+
+    terra::rast(path, lyrs = idx) |>
+      terra::spatSample(size = 4e5, method = "regular", as.raster = TRUE)
+  })
+
+  # Long axis horizontal, aspect deliberately broken: a 24339 x 2184 strip drawn
+  # true to scale is either an unusable ribbon or an endless scroll. Plot units
+  # are full-resolution line and sample indices, so brush coordinates arrive in
+  # capture coordinates and need no rescaling from the decimated preview.
+  output$sat_preview_plot <- shiny::renderPlot({
+    preview <- sat_preview()
+    src <- sat_source()
+    n_line <- terra::nrow(src)
+    n_sample <- terra::ncol(src)
+
+    values <- terra::stretch(preview, minq = 0.02, maxq = 0.98) |>
+      terra::values()
+    values[is.na(values)] <- 0
+
+    img <- grDevices::rgb(
+      values[, 1],
+      values[, 2],
+      values[, 3],
+      maxColorValue = 255
+    ) |>
+      matrix(
+        nrow = terra::nrow(preview),
+        ncol = terra::ncol(preview),
+        byrow = TRUE
+      ) |>
+      t()
+
+    graphics::par(mar = c(4, 4, 1, 1))
+    graphics::plot(
+      NA,
+      xlim = c(0, n_line),
+      ylim = c(n_sample, 0),
+      xlab = "line",
+      ylab = "sample",
+      xaxs = "i",
+      yaxs = "i",
+      asp = NA
+    )
+    graphics::rasterImage(img, 0, n_sample, n_line, 0, interpolate = FALSE)
+  })
+
+  sat_result <- shiny::eventReactive(input$sat_run, {
+    cap <- found()
+    shiny::req(cap)
+    path <- envi_data(cap[["target"]])
+    shiny::req(path)
+
+    pct <- input$sat_percent
+    shiny::req(is.numeric(pct), !is.na(pct))
+    limit <- SATURATION_CEILING * pct / 100
+
+    step <- as.integer(input$sat_band_step %||% "1")
+
+    # A fresh handle, because SpatRaster carries a shared pointer and setting a
+    # window on the cached one would leak the region of interest into the preview.
+    # Bands are chosen at open time: subsetting afterwards would still read the
+    # whole cube.
+    n_band <- terra::nlyr(terra::rast(path))
+    bands <- seq(1, n_band, by = step)
+    x <- terra::rast(path, lyrs = bands)
+    n_line <- terra::nrow(x)
+    n_sample <- terra::ncol(x)
+    roi <- brush_window(input$sat_brush, n_line, n_sample)
+
+    # The region to screen, in the raster's own coordinates: the brush rectangle
+    # or the whole frame.
+    x_min <- if (is.null(roi)) 0 else terra::xmin(roi)
+    x_max <- if (is.null(roi)) n_sample else terra::xmax(roi)
+    y_min <- if (is.null(roi)) 0 else terra::ymin(roi)
+    y_max <- if (is.null(roi)) n_line else terra::ymax(roi)
+
+    # Screened in blocks of lines so the progress bar tracks real work rather
+    # than spinning: the collapsed mask is per pixel, so block counts sum to the
+    # count for the whole region. Blocks are contiguous line ranges, which is the
+    # order the data sits in on disk, and integer edges fall on cell boundaries
+    # so the blocks partition the region exactly. Reading runs from the first
+    # line to the last.
+    # Twelve blocks at most: each window change costs roughly 0.7 s of GDAL
+    # re-initialisation, measured at about 20% overhead over fifteen blocks, and
+    # twelve updates already read as a moving bar.
+    n_block <- max(1, min(12, floor((y_max - y_min) / 200)))
+    edges <- round(seq(y_max, y_min, length.out = n_block + 1))
+
+    message <- if (step == 1L) {
+      "Reading every band"
+    } else {
+      paste("Reading", length(bands), "of", n_band, "bands")
+    }
+
+    shiny::withProgress(message = message, value = 0, {
+      tryCatch(
+        {
+          screened <- purrr::map(seq_len(n_block), \(i) {
+            # window(), never crop(): cropping a raw integer capture materialises
+            # a copy in the source datatype, which makes terra reserve 65535 as
+            # NoData. Every genuinely clipped reading would come back NA and the
+            # screen would report a clean scan.
+            terra::window(x) <- NULL
+            terra::window(x) <- terra::ext(
+              x_min,
+              x_max,
+              edges[[i + 1]],
+              edges[[i]]
+            )
+
+            mask <- HSItools::hsi_check_saturation(
+              x,
+              limit = limit,
+              collapse = TRUE
+            )
+            # Dimensions come back from the windowed raster, never from the
+            # brush: terra snaps the window to cell boundaries, and the brush
+            # rectangle is fractional.
+            block <- list(
+              rows = terra::nrow(x),
+              cols = terra::ncol(x),
+              cells = terra::ncell(x),
+              saturated = terra::global(mask, "sum", na.rm = TRUE)[[1]]
+            )
+
+            shiny::incProgress(
+              1 / n_block,
+              detail = paste("block", i, "of", n_block)
+            )
+
+            block
+          })
+
+          list(
+            limit = limit,
+            # Summed rather than derived, so the report describes what was
+            # actually read.
+            lines = sum(purrr::map_dbl(screened, "rows")),
+            samples = screened[[1]][["cols"]],
+            cells = sum(purrr::map_dbl(screened, "cells")),
+            saturated = sum(purrr::map_dbl(screened, "saturated")),
+            roi = !is.null(roi),
+            bands = length(bands),
+            n_band = n_band
+          )
+        },
+        error = \(e) e
+      )
+    })
+  })
+
+  output$sat_report <- shiny::renderUI({
+    res <- sat_result()
+
+    if (inherits(res, "error")) {
+      return(shiny::div(
+        class = "alert alert-danger mt-3 mb-0",
+        conditionMessage(res)
+      ))
+    }
+
+    share <- 100 * res[["saturated"]] / res[["cells"]]
+
+    # Any clipping at all is worth seeing; the tiers only say how loudly.
+    theme <- if (res[["saturated"]] == 0) {
+      "success"
+    } else if (share < 0.1) {
+      "warning"
+    } else {
+      "danger"
+    }
+
+    # A sampled screen can miss a saturated pixel but never invent one, so its
+    # number is a floor rather than a measurement, and it is worded as one.
+    sampled <- res[["bands"]] < res[["n_band"]]
+
+    verdict <- if (res[["saturated"]] == 0 && sampled) {
+      "No overexposed pixels found"
+    } else if (res[["saturated"]] == 0) {
+      "No overexposed pixels"
+    } else {
+      paste0(
+        if (sampled) "At least " else "",
+        format(round(share, 3), trim = TRUE),
+        "% of pixels overexposed"
+      )
+    }
+
+    shiny::div(
+      class = paste0("alert alert-", theme, " mt-2 mb-0 py-2"),
+      shiny::strong(verdict),
+      shiny::br(),
+      shiny::span(
+        class = "small",
+        sprintf(
+          "%s of %s pixels at or above %g DN, over %s lines x %s samples (%s).",
+          format(
+            res[["saturated"]],
+            big.mark = " ",
+            scientific = FALSE,
+            trim = TRUE
+          ),
+          format(
+            res[["cells"]],
+            big.mark = " ",
+            scientific = FALSE,
+            trim = TRUE
+          ),
+          round(res[["limit"]]),
+          format(res[["lines"]], big.mark = " ", trim = TRUE),
+          format(res[["samples"]], big.mark = " ", trim = TRUE),
+          if (res[["roi"]]) "region of interest" else "full frame"
+        ),
+        if (sampled) {
+          sprintf(
+            " Screened %s of %s bands, so the count is a lower bound.",
+            res[["bands"]],
+            res[["n_band"]]
+          )
+        }
+      )
+    )
   })
 }
 
