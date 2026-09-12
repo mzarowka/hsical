@@ -320,7 +320,9 @@ ratio_tier <- function(ratio) {
   }
   if (ratio >= 0.95 && ratio <= 1.05) {
     return(list(
-      theme = "success",
+      # Blue, not green: a good reading is the same family as the commit action,
+      # and red-ish is its counterpart. The app spends no colour on green.
+      theme = "primary",
       icon = "check-square",
       label = "\u2713 Square pixels"
     ))
@@ -442,6 +444,12 @@ nz <- function(v) {
 # ==========================================================================
 
 ui <- bslib::page_navbar(
+  # The chrome band, in the palette's own plum rather than the hue-rotated one:
+  # a large surface wants less saturation than a small accent, and this keeps
+  # the app's two loud colours — blue for commit, red for destroy — spent on
+  # things the operator acts on rather than on the frame around them.
+  navbar_options = bslib::navbar_options(bg = "#685D79"),
+
   # Displayed as HSIcal to sit with HSItools; the package itself stays `hsical`.
   # The HSItools hex, left of the name, sized to the brand text. Served from
   # inst/app/www, which Shiny publishes at the app root.
@@ -462,7 +470,17 @@ ui <- bslib::page_navbar(
   # the shadow would leave the cards with no edge at all.
   theme = bslib::bs_theme(
     version = 5,
-    primary = "#2c6e8f",
+    # One rule for the accents: the slate anchor, hue-rotated at its own
+    # saturation and lightness (H?, S26, L38). Every one of them clears WCAG AA
+    # with white text — 6.8:1 blue, 7.4:1 red, 5.6:1 amber — where the source
+    # palette's brighter rose and orange managed 3.1:1 and 2.4:1 and could not
+    # carry a button. Colour is spent on two axes and no others: blue for a
+    # committing action or a reading that is fine, red for a destructive action
+    # or a reading that is not, amber for the middle. Nothing is green — a good
+    # aspect ratio belongs to the same family as the Save button.
+    primary = "#475C7A",
+    danger = "#7A474E",
+    warning = "#7A6547",
     # Square everything: `border-radius` covers the form controls, `card-border-
     # radius` is needed on top of it because bslib rounds cards to 8px of its own
     # accord. The card border replaces the shadow as the thing that separates one
@@ -490,22 +508,40 @@ ui <- bslib::page_navbar(
     # nobody is looking. Centred and enlarged, because everything this app says
     # is a correction the operator has to act on before the next scan.
     bslib::bs_add_rules(
-      # The tabs are the app's top-level navigation and rendered at the same
-      # 14px as the field labels beneath them. Set here rather than through
-      # `nav-link-font-size` / `nav-link-font-weight`, which bslib overrides
-      # downstream of the theme — the variables took, the styling did not.
-      ".navbar .navbar-nav .nav-link {
+      c(
+        # Verdict backgrounds, set by hand. Bootstrap mixes them from the theme
+        # colours, and because those are deliberately muted the three came out
+        # within ten points a channel of each other — clean, some and a lot all
+        # sat on the same grey. These keep the hue the accents carry. The cost is
+        # that they no longer follow `primary`/`warning`/`danger` automatically:
+        # change an accent and these three need changing with it.
+        ".alert-primary { --bs-alert-bg: #E1E9F4; }
+       .alert-warning { --bs-alert-bg: #F4ECE1; }
+       .alert-danger  { --bs-alert-bg: #F4E1E4; }",
+        # The tabs are the app's top-level navigation and rendered at the same
+        # 14px as the field labels beneath them. Set here rather than through
+        # `nav-link-font-size` / `nav-link-font-weight`, which bslib overrides
+        # downstream of the theme — the variables took, the styling did not.
+        ".navbar .navbar-nav .nav-link {
          font-size: 1.05rem;
          font-weight: 500;
        }
        .navbar .navbar-nav .nav-link.active {
          font-weight: 700;
        }
-       /* Doubled id on purpose: bslib pins the panel with a rule of its own at
-          `#shiny-notification-panel#shiny-notification-panel`, and a single id
-          loses to it. Left unmatched, its `bottom` survived alongside our
-          `top`, stretching the panel between the two — a 59px toast adrift in a
-          438px box, sitting well above centre. */
+       /* Card headers ship with 4px of vertical padding, which put the load
+          button hard against the card's own top border. bslib halves the
+          variable in a `padding-block` shorthand at `.bslib-card .card-header`,
+          so this has to out-specify that rule and use the same property — a
+          longhand `padding-top` loses to it, and `card-cap-padding-y` arrives
+          halved (0.75rem in gave 6px out). */
+       .card.bslib-card > .card-header {
+         padding-block: 0.75rem;
+       }
+       /* The first card sat hard against the navbar. */
+       .container-fluid > .tab-content {
+         padding-top: 0.75rem;
+       }
        /* bslib gives every card `overflow: auto`, which makes the card itself
           the scroll container — and a footer cannot stick to a box that never
           scrolls. Letting this one overflow visibly hands the job back to the
@@ -520,6 +556,11 @@ ui <- bslib::page_navbar(
          background-color: #ffffff;
          border-top: 1px solid #ced4da;
        }
+       /* Doubled id on purpose: bslib pins the panel with a rule of its own at
+          `#shiny-notification-panel#shiny-notification-panel`, and a single id
+          loses to it. Left unmatched, its `bottom` survived alongside our
+          `top`, stretching the panel between the two — a 59px toast adrift in a
+          438px box, sitting well above centre. */
        #shiny-notification-panel#shiny-notification-panel {
          top: 50%; left: 50%; right: auto; bottom: auto;
          transform: translate(-50%, -50%);
@@ -531,6 +572,7 @@ ui <- bslib::page_navbar(
          padding: 1rem 2.5rem 1rem 1.25rem;
          opacity: 1;
        }"
+      )
     ),
 
   bslib::nav_panel(
@@ -919,7 +961,11 @@ ui <- bslib::page_navbar(
               "clear_session",
               "Clear session",
               icon = bsicons::bs_icon("eraser"),
-              class = "btn-outline-secondary"
+              # Filled, not outlined: the other buttons on this bar are outlined
+              # pickers, so an outlined Clear read as one more of them and the
+              # only thing marking it destructive was a border colour. Solid is
+              # the divide — filled means the button changes something.
+              class = "btn-danger"
             )
           )
         )
@@ -978,7 +1024,7 @@ ui <- bslib::page_navbar(
       # form panels then overflowed it with nothing to scroll — on a 900px
       # window Save sat at y=996 and could not be reached at all. Only this
       # card needs the window, so only this card asks for it.
-      height = "calc(100vh - 6rem)",
+      height = "calc(100vh - 7rem)",
       bslib::card_header(
         shiny::div(
           class = "d-flex gap-3 flex-wrap align-items-center",
@@ -1879,7 +1925,7 @@ server <- function(input, output, session) {
 
     # Any clipping at all is worth seeing; the tiers only say how loudly.
     theme <- if (res[["saturated"]] == 0) {
-      "success"
+      "primary"
     } else if (share < 0.1) {
       "warning"
     } else {
