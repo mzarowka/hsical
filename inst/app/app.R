@@ -443,7 +443,17 @@ nz <- function(v) {
 
 ui <- bslib::page_navbar(
   # Displayed as HSIcal to sit with HSItools; the package itself stays `hsical`.
-  title = "HSIcal",
+  # The HSItools hex, left of the name, sized to the brand text. Served from
+  # inst/app/www, which Shiny publishes at the app root.
+  title = shiny::tagList(
+    shiny::img(
+      src = "hsitools-logo.png",
+      alt = "",
+      height = "28px",
+      class = "me-2 align-text-bottom"
+    ),
+    "HSIcal"
+  ),
   # Square corners and no drop shadows: the cards are here to group fields on an
   # instrument panel, not to float above a dashboard. The shadow is dropped with
   # bslib's own `bslib-card-box-shadow-none` class on each card rather than by
