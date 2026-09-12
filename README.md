@@ -1,11 +1,11 @@
-# hsical
+# HSIcal
 
 A Shiny companion for hyperspectral core-scanning sessions on a Specim rig. It treats
 every scan the same way — whether taken to test the geometry, confirm it, or keep it —
 and turns one capture into one metadata sidecar.
 
-hsical **owns no schema of its own**. The sidecar's structure, serialization, and
-validation belong to [HSItools](https://github.com/mzarowka/HSItools); hsical is an
+HSIcal **owns no schema of its own**. The sidecar's structure, serialization, and
+validation belong to [HSItools](https://github.com/mzarowka/HSItools); HSIcal is an
 argument collector for `HSItools::hsi_create_metadata()` and a thin wrapper around
 `hsi_write_metadata()` / `hsi_read_metadata()`. It never processes spectral data —
 no reflectance, no masking, no co-registration.
@@ -32,7 +32,7 @@ On a rig PC, a one-double-click desktop launcher is available under
 
 ### Scan panel
 
-Load one capture `.hdr` and hsical discovers the rest of the scan folder — the
+Load one capture `.hdr` and HSIcal discovers the rest of the scan folder — the
 `WHITEREF` and `DARKREF` siblings and the Lumo `.log` — from that single pick, and
 autofills what the files already know (`lines`, `samples`, `bands`, integration times,
 frame rate, binning, calibration pack, dropped frames, and the full wavelength / FWHM

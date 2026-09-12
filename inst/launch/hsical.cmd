@@ -1,6 +1,6 @@
 @echo off
 rem ===========================================================================
-rem hsical launcher — starts the Shiny server (once) and opens it in a
+rem HSIcal launcher — starts the Shiny server (once) and opens it in a
 rem chrome-less browser window. Double-click, or point a Desktop shortcut here
 rem (see Install-HsicalShortcut.ps1). Idempotent: if the server is already
 rem running on %PORT%, it just opens another clean window against it.
@@ -26,7 +26,7 @@ if not defined RSCRIPT (
 
 rem --- start the server only if the port isn't already listening -------------
 call :port_up && goto :wait
-start "hsical server" /min "%RSCRIPT%" -e "hsical::run_app(port=%PORT%, host='127.0.0.1', launch.browser=FALSE)"
+start "HSIcal server" /min "%RSCRIPT%" -e "hsical::run_app(port=%PORT%, host='127.0.0.1', launch.browser=FALSE)"
 
 rem --- wait (up to ~60s) for the server to accept connections ----------------
 :wait

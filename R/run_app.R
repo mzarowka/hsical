@@ -1,4 +1,4 @@
-#' Run the hsical Shiny App
+#' Run the HSIcal Shiny App
 #'
 #' Launches the hyperspectral image calibration tool.
 #'

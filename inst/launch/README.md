@@ -1,4 +1,4 @@
-# Launching hsical on the rig PC
+# Launching HSIcal on the rig PC
 
 A one-double-click launcher: it starts the Shiny server and opens the app in a
 clean browser window — no tabs, no address bar, no menus.
@@ -6,7 +6,7 @@ clean browser window — no tabs, no address bar, no menus.
 ## Prerequisites (on the rig)
 
 - **R** installed (any recent version, under `C:\Program Files\R\...`).
-- **hsical** installed into that R, so `hsical::run_app()` works:
+- **HSIcal** installed into that R, so `hsical::run_app()` works:
   ```r
   # install.packages("remotes")
   remotes::install_github("mzarowka/hsical")   # or install from a local copy
@@ -23,13 +23,17 @@ Copy this `launch` folder to the rig (or use the installed copy at
 powershell -ExecutionPolicy Bypass -File Install-HsicalShortcut.ps1
 ```
 
-That drops an **hsical** shortcut on the Desktop, set to run minimized.
+That drops an **HSIcal** shortcut on the Desktop, set to run minimized.
+
+If a rig already has the older lowercase **hsical** shortcut, the installer
+leaves it alone rather than deleting anything from your Desktop — it still
+works, but delete it by hand so operators see only one.
 
 ## Daily use
 
-Double-click **hsical**. You get:
+Double-click **HSIcal**. You get:
 
-- a minimized **hsical server** console in the taskbar (the running R process), and
+- a minimized **HSIcal server** console in the taskbar (the running R process), and
 - a clean **app window** with the tool in it.
 
 Click it again later and it reuses the already-running server — it won't start a
@@ -38,7 +42,7 @@ second one.
 ## Stopping / restarting
 
 - Closing the app window leaves the server running (so reopening is instant).
-- To stop the server, close the minimized **hsical server** console, or end the
+- To stop the server, close the minimized **HSIcal server** console, or end the
   `Rscript.exe` task. A reboot clears it too.
 
 ## Tweaks

@@ -94,9 +94,13 @@ parse_hdr <- function(hdr_path) {
     NA_character_
   }
 
-  # Calibration pack path
+  # Calibration pack: file name only. The directory is a fact about one rig's
+  # disk — the two cameras' packs do not even share a folder, one living under
+  # Documents and the other under Program Files — so the path would put a
+  # machine's layout into the scan record. The file name is what identifies the
+  # calibration, and it is what the sidecar stores.
   cal_raw <- xval("(?<=calibration pack = )[^\n]+")
-  cal <- if (!is.na(cal_raw)) trimws(cal_raw) else NA_character_
+  cal <- if (is.na(cal_raw)) NA_character_ else basename(trimws(cal_raw))
 
   # The pack file name carries the objective, but not at a fixed position: the
   # VNIR packs run it into the word (560025_20211124_OLE18.5calpack.scp) while
@@ -109,8 +113,9 @@ parse_hdr <- function(hdr_path) {
   lens <- if (is.na(cal)) {
     NA_character_
   } else {
-    known <- setdiff(LENS_CHOICES, "")
-    hits <- known[purrr::map_lgl(known, \(i) grepl(i, cal, fixed = TRUE))]
+    hits <- LENS_KNOWN[
+      purrr::map_lgl(LENS_KNOWN, \(i) grepl(i, cal, fixed = TRUE))
+    ]
     if (length(hits) == 0) NA_character_ else hits[[which.max(nchar(hits))]]
   }
 
@@ -238,9 +243,45 @@ BAND_STEPS <- c(
   "16th" = "16"
 )
 
+# The scan's five numbers and the band count are all short — the widest real
+# value is a five-digit line count — so the fields are sized to the numbers they
+# hold rather than to the column they sit in. Wide enough that the longest label
+# ("Samples (cols)") still fits on one line.
+NUMERIC_FIELD_WIDTH <- "140px"
+
+# Names, ids and prefixes. Wide enough for an operator's name, narrow enough
+# that four sit on one row of a half-width column.
+TEXT_FIELD_WIDTH <- "200px"
+
+# The acquisition numerics hold values as short as `1`, but their labels do not:
+# "Spectral resolution (nm)" needs 201px against a 140px field, and seven of the
+# eleven wrapped onto a second line. A wrapped label costs 24px of height on
+# every field in the row, which is more than the narrow box ever saved — so
+# these are sized to the label rather than to the number.
+LABELLED_FIELD_WIDTH <- "205px"
+
+# The one non-white surface in the app: the page behind the cards, the closed
+# accordion bars, and the input fields. Named because it is used in several
+# places that must not drift apart.
+SURFACE_GROUND <- "#edeff1"
+
 # Specim objectives: OL50 and OLE18.5 on the VNIR camera, OLES30 and OLESmacro
 # on the SWIR. The leading blank keeps the field empty until something fills it.
-LENS_CHOICES <- c("", "OL50", "OLE18.5", "OLES30", "OLESmacro")
+LENS_BY_SENSOR <- list(
+  VNIR = c("OL50", "OLE18.5"),
+  SWIR = c("OLES30", "OLESmacro")
+)
+
+# Every objective the app knows, for matching against a calibration pack name.
+LENS_KNOWN <- unlist(LENS_BY_SENSOR, use.names = FALSE)
+
+# The escape hatch. VNIR and SWIR are spectral ranges, so the sensor list is
+# genuinely closed whatever camera the lab buys — but objective names are vendor
+# hardware, and the lab has non-Specim data. Offering only the four Specim
+# optics would force a wrong answer on a HySpex capture, so "Other" reveals a
+# free-text field. Deliberate and visible, rather than a box that silently
+# accepts anything.
+LENS_OTHER <- "Other…"
 
 # Both cameras are 16-bit. The screen limit is a percentage of this ceiling
 # rather than the ceiling itself: detector response compresses before it clips,
@@ -307,8 +348,7 @@ SESSION_TEXT <- c(
   "session_id",
   "operator",
   "campaign_prefix",
-  "dataset_name",
-  "calibration_pack"
+  "dataset_name"
 )
 SESSION_NUMERIC <- c(
   "fov_mm",
@@ -351,6 +391,34 @@ REVIEW_NUMERIC <- c(
 )
 REVIEW_READONLY <- c("schema_version", "wavelengths", "fwhm")
 
+# A labelled group of fields. Grouping and collapsing are separate things: the
+# labelled boundary is what an operator navigates by, while the collapsing cost
+# four 52px headers and a click before anything could be typed — and it existed
+# only to contain a height that came from fields three times wider than their
+# own content.
+field_group <- function(title, icon, ...) {
+  shiny::div(
+    class = "mb-4",
+    shiny::div(
+      class = "d-flex align-items-center gap-2 mb-2 pb-1 border-bottom",
+      bsicons::bs_icon(icon, class = "text-primary"),
+      shiny::strong(title)
+    ),
+    ...
+  )
+}
+
+# The objectives a sensor offers, plus the escape hatch. Before a sensor is
+# picked there is nothing to offer but the hatch.
+lens_choices <- function(sensor) {
+  known <- if (length(sensor) == 1 && sensor %in% names(LENS_BY_SENSOR)) {
+    LENS_BY_SENSOR[[sensor]]
+  } else {
+    character(0)
+  }
+  c(known, LENS_OTHER)
+}
+
 # Blank -> NULL: hsi_create_metadata() wants NULL for absent fields, never "" or NA
 # (a blank numericInput returns logical NA, so test is.na() before type).
 nz <- function(v) {
@@ -374,20 +442,97 @@ nz <- function(v) {
 # ==========================================================================
 
 ui <- bslib::page_navbar(
-  title = "hsical",
-  theme = bslib::bs_theme(version = 5, primary = "#2c6e8f"),
-
-  # Only the screening panel fills the window: its preview is the one thing that
-  # gets more useful with more height, since picking a region of interest across
-  # track means resolving the tape edge. The form panels keep their natural
-  # height and scroll.
-  fillable = "Saturation",
+  # Displayed as HSIcal to sit with HSItools; the package itself stays `hsical`.
+  title = "HSIcal",
+  # Square corners and no drop shadows: the cards are here to group fields on an
+  # instrument panel, not to float above a dashboard. The shadow is dropped with
+  # bslib's own `bslib-card-box-shadow-none` class on each card rather than by
+  # hand, because that class also restores the card border — bslib leaves the
+  # border transparent and lets the shadow do the separating, so removing only
+  # the shadow would leave the cards with no edge at all.
+  theme = bslib::bs_theme(
+    version = 5,
+    primary = "#2c6e8f",
+    # Square everything: `border-radius` covers the form controls, `card-border-
+    # radius` is needed on top of it because bslib rounds cards to 8px of its own
+    # accord. The card border replaces the shadow as the thing that separates one
+    # panel from the next, so it is a solid grey rather than bslib's 10%-alpha
+    # tint, which all but disappears on white.
+    "border-radius" = "0",
+    "card-border-radius" = "0",
+    "card-border-color" = "#ced4da",
+    # White cards on a white page left nothing to separate one panel from the
+    # next once the shadows went. A near-white ground does that structural work
+    # without spending any colour on it. Two surfaces only, used consistently:
+    # the ground for the page, the accordion's closed header bars and the input
+    # fields; white for anything holding content.
+    #
+    # The accordion needs both variables. Bootstrap derives the header bar from
+    # `accordion-bg`, so leaving it at the ground colour tinted the open body
+    # too — and grey fields on a grey body have no contrast at all, which is the
+    # one place this scheme fell over.
+    "body-bg" = SURFACE_GROUND,
+    "card-bg" = "#ffffff",
+    "accordion-bg" = "#ffffff",
+    "accordion-button-bg" = SURFACE_GROUND
+  ) |>
+    # Notifications land bottom-right by default, which on a rig screen is where
+    # nobody is looking. Centred and enlarged, because everything this app says
+    # is a correction the operator has to act on before the next scan.
+    bslib::bs_add_rules(
+      # The tabs are the app's top-level navigation and rendered at the same
+      # 14px as the field labels beneath them. Set here rather than through
+      # `nav-link-font-size` / `nav-link-font-weight`, which bslib overrides
+      # downstream of the theme — the variables took, the styling did not.
+      ".navbar .navbar-nav .nav-link {
+         font-size: 1.05rem;
+         font-weight: 500;
+       }
+       .navbar .navbar-nav .nav-link.active {
+         font-weight: 700;
+       }
+       /* Doubled id on purpose: bslib pins the panel with a rule of its own at
+          `#shiny-notification-panel#shiny-notification-panel`, and a single id
+          loses to it. Left unmatched, its `bottom` survived alongside our
+          `top`, stretching the panel between the two — a 59px toast adrift in a
+          438px box, sitting well above centre. */
+       /* bslib gives every card `overflow: auto`, which makes the card itself
+          the scroll container — and a footer cannot stick to a box that never
+          scrolls. Letting this one overflow visibly hands the job back to the
+          page, which is what the action bar sticks to. */
+       .scan-form-card {
+         overflow: visible;
+       }
+       .sticky-action-bar {
+         position: sticky;
+         bottom: 0;
+         z-index: 5;
+         background-color: #ffffff;
+         border-top: 1px solid #ced4da;
+       }
+       #shiny-notification-panel#shiny-notification-panel {
+         top: 50%; left: 50%; right: auto; bottom: auto;
+         transform: translate(-50%, -50%);
+         width: auto; max-width: 34rem;
+         height: auto;
+       }
+       #shiny-notification-panel .shiny-notification {
+         font-size: 1.05rem;
+         padding: 1rem 2.5rem 1rem 1.25rem;
+         opacity: 1;
+       }"
+    ),
 
   bslib::nav_panel(
     title = "Scan",
 
     # ---- Card 1: the scan and its geometry -------------------------------
     bslib::card(
+      class = "bslib-card-box-shadow-none",
+      # Sized to its content: as a fill item inside a fill page the card was
+      # clipped to the viewport and scrolled internally, so the tab had a scroll
+      # region inside a scroll region. Only the screening card fills.
+      fill = FALSE,
       bslib::card_header(
         shiny::div(
           class = "d-flex gap-3 flex-wrap align-items-start",
@@ -422,36 +567,42 @@ ui <- bslib::page_navbar(
               shiny::numericInput(
                 "target_start_mm",
                 tip("Start (mm)", "Motor position at scan start."),
-                value = NA
+                value = NA,
+                width = NUMERIC_FIELD_WIDTH
               ),
               shiny::numericInput(
                 "target_stop_mm",
                 tip("Stop (mm)", "Motor position at scan stop."),
-                value = NA
+                value = NA,
+                width = NUMERIC_FIELD_WIDTH
               ),
               shiny::numericInput(
                 "fov_mm",
                 tip("FOV (mm)", "Across-track field of view set in Lumo."),
                 value = NA,
-                min = 0
+                min = 0,
+                width = NUMERIC_FIELD_WIDTH
               ),
               shiny::numericInput(
                 "nrow",
                 tip("Lines (rows)", "Along-track. From the .hdr `lines`."),
                 value = NA,
-                min = 1
+                min = 1,
+                width = NUMERIC_FIELD_WIDTH
               ),
               shiny::numericInput(
                 "ncol",
                 tip("Samples (cols)", "Across-track. From the .hdr `samples`."),
                 value = NA,
-                min = 1
+                min = 1,
+                width = NUMERIC_FIELD_WIDTH
               ),
               shiny::numericInput(
                 "nlyr",
                 tip("Bands", "From the .hdr `bands`."),
                 value = NA,
-                min = 1
+                min = 1,
+                width = NUMERIC_FIELD_WIDTH
               )
             )
           ),
@@ -459,29 +610,58 @@ ui <- bslib::page_navbar(
           # Right: everything the five numbers above imply. Nothing is typed
           # here — that is the point.
           shiny::div(
+            # Derived values carry the one bit of colour on this card: the whole
+            # point of the panel is that five numbers are typed and the rest is
+            # computed, and in plain text the two were indistinguishable.
             bslib::layout_columns(
               col_widths = c(7, 5),
               shiny::div(
                 shiny::div(
                   shiny::strong("Scan length: "),
-                  shiny::textOutput("out_length", inline = TRUE)
+                  shiny::span(
+                    class = "text-primary fw-semibold",
+                    shiny::textOutput("out_length", inline = TRUE)
+                  )
                 ),
                 shiny::div(
                   shiny::strong("Est. scan time: "),
-                  shiny::textOutput("out_scan_time", inline = TRUE)
+                  shiny::span(
+                    class = "text-primary fw-semibold",
+                    shiny::textOutput("out_scan_time", inline = TRUE)
+                  )
+                ),
+                # Named for what it is rather than for the sidecar keys, which
+                # read as jargon on screen — the keys stay in brackets because
+                # that is what lands in the file. Two numbers, never averaged: a
+                # single figure would describe no pixel in the raster and would
+                # hide exactly the anisotropy this panel exists to expose.
+                shiny::div(
+                  class = "mt-2",
+                  shiny::strong("Spatial resolution")
                 ),
                 shiny::div(
-                  shiny::strong("yres (along-track): "),
-                  shiny::textOutput("out_yres", inline = TRUE)
+                  class = "ms-3",
+                  shiny::strong("along-track (yres): "),
+                  shiny::span(
+                    class = "text-primary fw-semibold",
+                    shiny::textOutput("out_yres", inline = TRUE)
+                  )
                 ),
                 shiny::div(
-                  shiny::strong("xres (across-track): "),
-                  shiny::textOutput("out_xres", inline = TRUE)
+                  class = "ms-3",
+                  shiny::strong("across-track (xres): "),
+                  shiny::span(
+                    class = "text-primary fw-semibold",
+                    shiny::textOutput("out_xres", inline = TRUE)
+                  )
                 ),
                 shiny::div(
                   class = "mt-2",
                   shiny::strong("Ideal FOV for square pixels: "),
-                  shiny::textOutput("out_ideal_fov", inline = TRUE)
+                  shiny::span(
+                    class = "text-primary fw-semibold",
+                    shiny::textOutput("out_ideal_fov", inline = TRUE)
+                  )
                 )
               ),
               shiny::uiOutput("out_ratio_box")
@@ -493,162 +673,208 @@ ui <- bslib::page_navbar(
 
     # ---- Card 2: the rest of the sidecar ---------------------------------
     bslib::card(
-      bslib::accordion(
-        id = "meta_accordion",
-        open = FALSE,
-        multiple = TRUE,
-
-        bslib::accordion_panel(
-          "Session",
-          icon = bsicons::bs_icon("collection"),
-          bslib::layout_columns(
-            col_widths = bslib::breakpoints(sm = 6, lg = 3),
-            shiny::textInput(
-              "session_id",
-              tip(
-                "Session ID",
-                "e.g. LAZ-26-S1. Groups scans sharing a white reference."
+      class = c("bslib-card-box-shadow-none", "scan-form-card"),
+      # Sized to its content: as a fill item inside a fill page the card was
+      # clipped to the viewport and scrolled internally, so the tab had a scroll
+      # region inside a scroll region. Only the screening card fills.
+      fill = FALSE,
+      bslib::card_body(
+        bslib::layout_columns(
+          col_widths = bslib::breakpoints(sm = 12, lg = c(5, 7)),
+          shiny::div(
+            field_group(
+              "Session",
+              "collection",
+              shiny::div(
+                class = "d-flex flex-wrap gap-3",
+                shiny::textInput(
+                  "session_id",
+                  tip(
+                    "Session ID",
+                    "Groups scans sharing one white reference."
+                  ),
+                  width = TEXT_FIELD_WIDTH
+                ),
+                shiny::textInput(
+                  "operator",
+                  tip("Operator", "Who ran the scan."),
+                  width = TEXT_FIELD_WIDTH
+                ),
+                shiny::textInput(
+                  "campaign_prefix",
+                  tip(
+                    "Campaign prefix",
+                    "The PREFIX in PREFIX_CC-SS_TIMESTAMP."
+                  ),
+                  width = TEXT_FIELD_WIDTH
+                ),
+                shiny::textInput(
+                  "dataset_name",
+                  tip("Dataset name", "The dataset this capture belongs to."),
+                  width = TEXT_FIELD_WIDTH
+                )
               )
             ),
-            shiny::textInput(
-              "operator",
-              tip("Operator", "Full first + last name.")
-            ),
-            shiny::textInput(
-              "campaign_prefix",
-              tip("Campaign prefix", "Lumo Setup value, e.g. LAZ-26.")
-            ),
-            shiny::textInput(
-              "dataset_name",
-              tip("Dataset name", "Lumo Capture value, CC-SS.")
-            )
-          )
-        ),
-
-        bslib::accordion_panel(
-          "Instrument",
-          icon = bsicons::bs_icon("camera"),
-          bslib::layout_columns(
-            col_widths = bslib::breakpoints(sm = 6, lg = 3),
-            shiny::selectizeInput(
-              "sensor_type",
-              tip("Sensor type", "VNIR / SWIR, or type a custom value."),
-              choices = c("VNIR", "SWIR"),
-              selected = character(0),
-              options = list(
-                create = TRUE,
-                placeholder = "VNIR / SWIR / custom"
+            field_group(
+              "Instrument",
+              "camera",
+              shiny::div(
+                class = "d-flex flex-wrap gap-3 align-items-start",
+                shiny::radioButtons(
+                  "sensor_type",
+                  tip(
+                    "Sensor type",
+                    "The spectral range, not the camera model. Closed on purpose: a new camera of any make is still one of these two."
+                  ),
+                  choices = names(LENS_BY_SENSOR),
+                  selected = character(0),
+                  inline = TRUE
+                ),
+                shiny::textInput(
+                  "manufacturer",
+                  tip(
+                    "Manufacturer",
+                    "Defaults to Specim, the rig this app targets."
+                  ),
+                  value = "Specim",
+                  width = TEXT_FIELD_WIDTH
+                ),
+                shiny::div(
+                  shiny::radioButtons(
+                    "lens",
+                    tip(
+                      "Lens",
+                      "The objectives available for the selected sensor. Pick the sensor first — switching it clears an objective that does not belong to the new one."
+                    ),
+                    choices = LENS_OTHER,
+                    selected = character(0),
+                    inline = TRUE
+                  ),
+                  # Client-side, so the field appears the instant "Other" is picked.
+                  shiny::conditionalPanel(
+                    condition = sprintf("input.lens == '%s'", LENS_OTHER),
+                    shiny::textInput(
+                      "lens_other",
+                      label = NULL,
+                      placeholder = "Objective name"
+                    )
+                  ),
+                  # Provenance for the field above rather than a field of its own:
+                  # the pack is where the objective was read from, it is never
+                  # typed, and only its file name is kept — the directory is a
+                  # fact about one rig's disk, not about the capture.
+                  shiny::div(
+                    class = "small text-muted",
+                    shiny::textOutput("cal_pack_note", inline = TRUE)
+                  )
+                )
               )
-            ),
-            shiny::textInput(
-              "manufacturer",
-              tip(
-                "Manufacturer",
-                "Defaults to Specim, the rig this app targets."
-              ),
-              value = "Specim"
-            ),
-            shiny::selectizeInput(
-              "lens",
-              tip(
-                "Lens",
-                "Specim objective. Pick one, or type a custom value."
-              ),
-              choices = LENS_CHOICES,
-              # The empty entry has to exist: with a list of real names and no
-              # blank, selectize adopts the first one, and every untouched save
-              # records a lens nobody chose.
-              selected = "",
-              options = list(
-                create = TRUE,
-                placeholder = "Select or type a lens"
-              )
-            ),
-            shiny::textInput(
-              "calibration_pack",
-              tip("Calibration pack", "Autofills from the .hdr.")
-            )
-          )
-        ),
-
-        bslib::accordion_panel(
-          "Acquisition",
-          icon = bsicons::bs_icon("grid-3x3"),
-          bslib::layout_columns(
-            col_widths = bslib::breakpoints(sm = 6, lg = 3),
-            shiny::numericInput(
-              "et_target_ms",
-              tip("ET target (ms)", "From the capture .hdr `tint`."),
-              value = NA
-            ),
-            shiny::numericInput(
-              "et_white_ms",
-              tip("ET white (ms)", "From the WHITEREF .hdr `tint`."),
-              value = NA
-            ),
-            shiny::numericInput(
-              "frame_rate_hz",
-              tip("Frame rate (Hz)", "From the .hdr `fps`."),
-              value = NA
-            ),
-            shiny::numericInput(
-              "scanning_speed_mm_s",
-              tip("Scanning speed (mm/s)", "As set in Lumo."),
-              value = NA
-            ),
-            shiny::numericInput(
-              "spectral_binning",
-              tip("Spectral binning", "From the .hdr binning."),
-              value = NA
-            ),
-            shiny::numericInput(
-              "spatial_binning",
-              tip("Spatial binning", "From the .hdr binning."),
-              value = NA
-            ),
-            shiny::numericInput(
-              "spectral_resolution_nm",
-              tip("Spectral resolution (nm)", "Calibrated value or blank."),
-              value = NA
-            ),
-            shiny::numericInput(
-              "camera_position_mm",
-              tip("Camera position (mm)", "Enables future focus-signature QC."),
-              value = NA
-            ),
-            shiny::numericInput(
-              "stage_position_mm",
-              tip("Stage position (mm)", "Enables future focus-signature QC."),
-              value = NA
             )
           ),
           shiny::div(
-            shiny::strong("Spectral axes: "),
-            shiny::textOutput("spectral_chip", inline = TRUE)
-          )
-        ),
-
-        bslib::accordion_panel(
-          "QC",
-          icon = bsicons::bs_icon("clipboard-check"),
-          bslib::layout_columns(
-            col_widths = c(6, 6),
-            shiny::numericInput(
-              "dropped_frames",
-              tip("Dropped frames", "From the .log. Zero is valid."),
-              value = NA,
-              min = 0
+            field_group(
+              "Acquisition",
+              "grid-3x3",
+              shiny::div(
+                class = "d-flex flex-wrap gap-3",
+                shiny::numericInput(
+                  "et_target_ms",
+                  tip("ET target (ms)", "From the capture .hdr `tint`."),
+                  value = NA,
+                  width = LABELLED_FIELD_WIDTH
+                ),
+                shiny::numericInput(
+                  "et_white_ms",
+                  tip("ET white (ms)", "From the WHITEREF .hdr `tint`."),
+                  value = NA,
+                  width = LABELLED_FIELD_WIDTH
+                ),
+                shiny::numericInput(
+                  "frame_rate_hz",
+                  tip("Frame rate (Hz)", "From the .hdr `fps`."),
+                  value = NA,
+                  width = LABELLED_FIELD_WIDTH
+                ),
+                shiny::numericInput(
+                  "scanning_speed_mm_s",
+                  tip("Scanning speed (mm/s)", "As set in Lumo."),
+                  value = NA,
+                  width = LABELLED_FIELD_WIDTH
+                ),
+                shiny::numericInput(
+                  "spectral_binning",
+                  tip("Spectral binning", "From the .hdr binning."),
+                  value = NA,
+                  width = LABELLED_FIELD_WIDTH
+                ),
+                shiny::numericInput(
+                  "spatial_binning",
+                  tip("Spatial binning", "From the .hdr binning."),
+                  value = NA,
+                  width = LABELLED_FIELD_WIDTH
+                ),
+                shiny::numericInput(
+                  "spectral_resolution_nm",
+                  tip("Spectral resolution (nm)", "Calibrated value or blank."),
+                  value = NA,
+                  width = LABELLED_FIELD_WIDTH
+                ),
+                shiny::numericInput(
+                  "camera_position_mm",
+                  tip(
+                    "Camera position (mm)",
+                    "Enables future focus-signature QC."
+                  ),
+                  value = NA,
+                  width = LABELLED_FIELD_WIDTH
+                ),
+                shiny::numericInput(
+                  "stage_position_mm",
+                  tip(
+                    "Stage position (mm)",
+                    "Enables future focus-signature QC."
+                  ),
+                  value = NA,
+                  width = LABELLED_FIELD_WIDTH
+                )
+              ),
+              shiny::div(
+                class = "small",
+                shiny::strong("Spectral axes: "),
+                shiny::textOutput("spectral_chip", inline = TRUE)
+              )
             ),
-            shiny::numericInput(
-              "gcp_count",
-              tip("GCP count", "Number of ground-control pins. Zero is valid."),
-              value = NA,
-              min = 0
+            field_group(
+              "QC",
+              "clipboard-check",
+              shiny::div(
+                class = "d-flex flex-wrap gap-3",
+                shiny::numericInput(
+                  "dropped_frames",
+                  tip("Dropped frames", "From the .log. Zero is valid."),
+                  value = NA,
+                  min = 0,
+                  width = LABELLED_FIELD_WIDTH
+                ),
+                shiny::numericInput(
+                  "gcp_count",
+                  tip(
+                    "GCP count",
+                    "Number of ground-control pins. Zero is valid."
+                  ),
+                  value = NA,
+                  min = 0,
+                  width = LABELLED_FIELD_WIDTH
+                )
+              )
             )
           )
         )
       ),
+      # Pinned: the form is a little over one screen on a rig monitor, and the
+      # commit action should never be the thing you have to go looking for.
       bslib::card_footer(
+        class = "sticky-action-bar",
         shiny::div(
           class = "d-flex align-items-center gap-2 flex-wrap",
           shinyFiles::shinyDirButton(
@@ -694,6 +920,11 @@ ui <- bslib::page_navbar(
   bslib::nav_panel(
     title = "Review",
     bslib::card(
+      class = "bslib-card-box-shadow-none",
+      # Sized to its content: as a fill item inside a fill page the card was
+      # clipped to the viewport and scrolled internally, so the tab had a scroll
+      # region inside a scroll region. Only the screening card fills.
+      fill = FALSE,
       bslib::card_header(
         shiny::div(
           class = "d-flex gap-3 flex-wrap align-items-center",
@@ -731,6 +962,13 @@ ui <- bslib::page_navbar(
   bslib::nav_panel(
     title = "Saturation",
     bslib::card(
+      class = "bslib-card-box-shadow-none",
+      # A viewport-relative height instead of page fill: naming a panel
+      # `fillable` makes the whole page a fixed-height flex container, and the
+      # form panels then overflowed it with nothing to scroll — on a 900px
+      # window Save sat at y=996 and could not be reached at all. Only this
+      # card needs the window, so only this card asks for it.
+      height = "calc(100vh - 6rem)",
       bslib::card_header(
         shiny::div(
           class = "d-flex gap-3 flex-wrap align-items-center",
@@ -841,9 +1079,70 @@ ui <- bslib::page_navbar(
 server <- function(input, output, session) {
   volumes <- shinyFiles::getVolumes()()
 
+  # The single place the lens radio is rewritten, so a sensor change and a scan
+  # load cannot fight over it. `keep_mismatch` says what to do with an objective
+  # that does not belong to `sensor`: an operator switching camera means the old
+  # objective is simply wrong and goes, while a calibration pack naming one means
+  # something is off with the capture and the value has to be seen, not dropped.
+  refresh_lens <- function(sensor, desired, keep_mismatch = FALSE) {
+    valid <- lens_choices(sensor)
+    desired <- nz(desired)
+
+    if (is.null(desired) || desired %in% valid) {
+      shiny::updateRadioButtons(
+        session,
+        "lens",
+        choices = valid,
+        selected = desired %||% character(0),
+        inline = TRUE
+      )
+      return(invisible(NULL))
+    }
+
+    shiny::updateRadioButtons(
+      session,
+      "lens",
+      choices = valid,
+      selected = if (keep_mismatch) LENS_OTHER else character(0),
+      inline = TRUE
+    )
+
+    if (keep_mismatch) {
+      shiny::updateTextInput(session, "lens_other", value = desired)
+      shiny::showNotification(
+        paste0(
+          desired,
+          " is not a ",
+          sensor,
+          " objective. Kept under Other — check the capture."
+        ),
+        type = "warning",
+        duration = NULL
+      )
+    } else {
+      shiny::updateTextInput(session, "lens_other", value = "")
+      shiny::showNotification(
+        paste0(desired, " is not a ", sensor, " objective. Lens cleared."),
+        type = "warning"
+      )
+    }
+  }
+
+  # Switching sensor re-offers that sensor's objectives and drops one that does
+  # not belong to it.
+  shiny::observeEvent(
+    input$sensor_type,
+    refresh_lens(input$sensor_type, input$lens, keep_mismatch = FALSE),
+    ignoreInit = TRUE
+  )
+
   # Autofilled spectral axes (never form fields): set on capture .hdr load,
   # feeds the chip and the save call.
   spectral <- shiny::reactiveVal(NULL)
+
+  # Read from the header, shown under the lens, never typed — so it is held here
+  # rather than in an input.
+  cal_pack <- shiny::reactiveVal(NULL)
 
   # What the last capture .hdr pick turned up in its folder.
   found <- shiny::reactiveVal(NULL)
@@ -961,12 +1260,18 @@ server <- function(input, output, session) {
   output$out_ratio_box <- shiny::renderUI({
     ratio <- geom()$aspect_ratio
     tier <- ratio_tier(ratio)
+    # Capped to the height of the two rows of fields beside it. Left uncapped the
+    # box stretches to the grid row and, being the tallest thing in it, sets the
+    # row height itself \u2014 241px against 149px of fields, which is the overhang.
+    # `fill = FALSE` does not help: the stretch comes from the grid, not the box.
     bslib::value_box(
       title = "Aspect ratio",
       value = if (is.na(ratio)) "\u2014" else round(ratio, 3),
       shiny::p(tier$label),
       showcase = bsicons::bs_icon(tier$icon),
-      theme = tier$theme
+      showcase_layout = "top right",
+      theme = tier$theme,
+      max_height = "150px"
     )
   })
 
@@ -992,29 +1297,25 @@ server <- function(input, output, session) {
       value = tools::file_path_sans_ext(basename(path))
     )
     if (!is.na(hdr[["camera"]])) {
-      shiny::updateSelectizeInput(
+      shiny::updateRadioButtons(
         session,
         "sensor_type",
-        selected = hdr[["camera"]]
+        selected = hdr[["camera"]],
+        inline = TRUE
       )
     }
-    if (!is.na(hdr[["calibration_pack"]])) {
-      shiny::updateTextInput(
-        session,
-        "calibration_pack",
-        value = hdr[["calibration_pack"]]
-      )
+    cal_pack(nz(hdr[["calibration_pack"]]))
+    # The header's sensor governs which objectives are on offer, so the lens is
+    # applied against the camera this capture actually names rather than against
+    # whatever was selected before. An objective the pack names that contradicts
+    # that sensor is surfaced under Other, never quietly dropped.
+    sensor <- if (is.na(hdr[["camera"]])) {
+      input$sensor_type
+    } else {
+      hdr[["camera"]]
     }
-    # An objective the pack names but the list does not know still has to be
-    # selectable, so it joins the choices rather than being dropped.
-    if (!is.na(hdr[["lens"]])) {
-      shiny::updateSelectizeInput(
-        session,
-        "lens",
-        choices = union(LENS_CHOICES, hdr[["lens"]]),
-        selected = hdr[["lens"]]
-      )
-    }
+
+    refresh_lens(sensor, hdr[["lens"]], keep_mismatch = TRUE)
     if (!is.na(hdr[["lines"]])) {
       shiny::updateNumericInput(session, "nrow", value = hdr[["lines"]])
     }
@@ -1117,6 +1418,10 @@ server <- function(input, output, session) {
     sprintf("%d bands, %.1f\u2013%.1f nm", length(wl), min(wl), max(wl))
   })
 
+  output$cal_pack_note <- shiny::renderText({
+    cal_pack() %||% "no calibration pack in the header"
+  })
+
   # ---- Save ------------------------------------------------------------
   shiny::observeEvent(input$save_dir_btn, {
     d <- shinyFiles::parseDirPath(volumes, input$save_dir_btn)
@@ -1152,8 +1457,13 @@ server <- function(input, output, session) {
       name = nm,
       sensor_type = nz(input$sensor_type),
       manufacturer = nz(input$manufacturer),
-      lens = nz(input$lens),
-      calibration_pack = nz(input$calibration_pack),
+      # "Other" is a marker for the radio, never a lens name.
+      lens = if (identical(input$lens, LENS_OTHER)) {
+        nz(input$lens_other)
+      } else {
+        nz(input$lens)
+      },
+      calibration_pack = cal_pack(),
       session_id = nz(input$session_id),
       operator = nz(input$operator),
       campaign_prefix = nz(input$campaign_prefix),
@@ -1223,14 +1533,22 @@ server <- function(input, output, session) {
     purrr::walk(SESSION_NUMERIC, \(id) {
       shiny::updateNumericInput(session, id, value = NA)
     })
-    shiny::updateSelectizeInput(session, "sensor_type", selected = character(0))
-    shiny::updateSelectizeInput(
+    shiny::updateRadioButtons(
+      session,
+      "sensor_type",
+      selected = character(0),
+      inline = TRUE
+    )
+    shiny::updateRadioButtons(
       session,
       "lens",
-      choices = LENS_CHOICES,
-      selected = ""
+      choices = LENS_OTHER,
+      selected = character(0),
+      inline = TRUE
     )
+    shiny::updateTextInput(session, "lens_other", value = "")
     shiny::updateTextInput(session, "manufacturer", value = "Specim")
+    cal_pack(NULL)
   })
 
   # ---- Review: read one sidecar back, edit it, write it in place --------
