@@ -1,6 +1,6 @@
 Package: hsical
 Title: Hyperspectral Image Calibration Tool
-Version: 2.1.0
+Version: 2.2.0
 Authors@R: c(
     person("Maurycy", "Żarczyński", , email = "maurycy.zarczynski@ug.edu.pl", role = c("aut", "cre")),
     person("Claude", role = "ctb", comment = "Anthropic; two-mode v2.0 rebuild, single-scan v2.1"))
