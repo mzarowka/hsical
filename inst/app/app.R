@@ -203,6 +203,91 @@ discover_capture <- function(hdr_path) {
   )
 }
 
+# Every capture under a folder, with what has and has not been logged for each.
+# Header text and file existence only — no capture is ever opened — so a
+# campaign of fifty scans costs fifty small text reads and the panel stays
+# usable on the scanning machine while a scan is running.
+scan_inventory <- function(root) {
+  hdrs <- list.files(
+    root,
+    pattern = "\\.hdr$",
+    recursive = TRUE,
+    full.names = TRUE,
+    ignore.case = TRUE
+  )
+
+  # A capture is a .hdr in a `capture/` folder that is not one of the two
+  # references standing beside it — the same shape discover_capture() assumes.
+  hdrs <- hdrs[
+    basename(dirname(hdrs)) == "capture" &
+      !grepl("^(WHITEREF|DARKREF)_", basename(hdrs), ignore.case = TRUE)
+  ]
+
+  # One row per capture, not one per path that reaches it. list.files() walks
+  # through a Windows junction (and a symlink) without saying so, so a working
+  # tree that links back into the archive lists every capture twice and the
+  # unlogged count — the number this panel exists to report — doubles with it.
+  # normalizePath() resolves the link to what it points at, which makes the two
+  # paths the same string.
+  hdrs <- unique(normalizePath(hdrs, winslash = "/", mustWork = FALSE))
+
+  records <- purrr::map(hdrs, \(path) {
+    hdr <- parse_hdr(path)
+    cap <- discover_capture(path)
+    name <- tools::file_path_sans_ext(basename(path))
+
+    # The Scan panel's own save convention: <scan root>/<name>.yaml. Reading it
+    # back is what makes this an inventory rather than a file listing.
+    sidecar <- file.path(cap[["scan_root"]], paste0(name, ".yaml"))
+
+    # The white-reference session is a scan of its own, in a folder beside this
+    # one under the same sensor. Reported, never judged: the marker below is a
+    # naming habit observed in one campaign, and one campaign is not evidence
+    # enough to fault a capture for not matching it.
+    siblings <- basename(list.dirs(
+      dirname(cap[["scan_root"]]),
+      recursive = FALSE
+    ))
+    wr <- siblings[wr_session_name(siblings)]
+
+    list(
+      path = path,
+      name = name,
+      scan_root = cap[["scan_root"]],
+      hdr = hdr,
+      white = !is.null(cap[["white"]]),
+      dark = !is.null(cap[["dark"]]),
+      log = !is.null(cap[["log"]]),
+      is_wr = wr_session_name(name),
+      wr_session = if (length(wr) == 0) NULL else wr[[1]],
+      sidecar = if (file.exists(sidecar)) sidecar else NULL
+    )
+  })
+
+  # Chronological, by what the header says rather than by what the folder is
+  # called: the operator's index into a day is the order the scans were taken.
+  # A capture whose header gives no date sorts to the end rather than to the
+  # front, where it would look like the first scan of the session — and it is
+  # sorted there by a flag rather than by a high sentinel character, because
+  # where such a character lands depends on the collation R happens to be
+  # running under. The dates themselves are ISO, so they sort as text.
+  undated <- purrr::map_lgl(records, \(r) {
+    date <- r[["hdr"]][["acquisition_date"]]
+    is.null(date) || is.na(date)
+  })
+
+  keys <- purrr::map_chr(records, \(r) {
+    date <- r[["hdr"]][["acquisition_date"]]
+    if (is.null(date) || is.na(date)) {
+      return("")
+    }
+    time <- r[["hdr"]][["start_time"]]
+    paste(date, if (is.na(time)) "" else time)
+  })
+
+  records[order(undated, keys)]
+}
+
 # terra refuses an ENVI .hdr path outright ("the data file should be selected
 # instead"), so every raster read goes through the binary sibling. Lumo writes
 # .raw; the fallback covers a vendor writing the same stem under another
@@ -241,6 +326,86 @@ BAND_STEPS <- c(
   "4th" = "4",
   "8th" = "8",
   "16th" = "16"
+)
+
+# Target grid for the saturation map. A percentage cannot distinguish a hot pixel
+# column from a blown tray rail, and that distinction is the recapture decision:
+# clipping on the sediment means recapture, clipping on the rail means draw the
+# region of interest tighter. The map costs nothing because the mask is already
+# computed in order to be counted — aggregating it with fun = "sum" yields the
+# same count (verified identical, ragged factors included) and the grid falls out
+# of the same read. Sized to the preview it overlays, not to the data.
+MAP_LINES <- 600
+MAP_SAMPLES <- 160
+
+# The clipped-fraction wash, as the visual language's bad-reading red. Alpha runs
+# with the square root of the fraction because a cell can cover several hundred
+# pixels: under a linear ramp a lone hot pixel would be invisible, which is the
+# one case the operator most needs to tell apart from real overexposure.
+MAP_RGB <- c(122, 71, 78)
+MAP_ALPHA_FLOOR <- 0.2
+MAP_ALPHA_RANGE <- 0.7
+
+# How a white-reference session announces itself in a scan folder's name. The
+# session is separate because the WHITEREF sibling inside a capture is taken at
+# the specimen's integration time and clips by design, so the usable reference
+# is this other scan.
+#
+# Lab policy from 2026-09-12 is a `_WR_` prefix and the date as the dataset
+# name, giving `_WR_2026-09-12_<time>` — every session then sorts to the top of
+# the sensor folder. The archive does not look like that: years of captures mark
+# the session in every imaginable way, so this matches WR as a *token* rather
+# than at a fixed position — any case, bounded by an underscore, a hyphen or the
+# ends of the name. That finds the policy form, the older infixed
+# `GKUT25_01_WR_<timestamp>`, and a bare `WR_...`, while still refusing the
+# letters inside a word: a core from Wrocław does not become a white reference.
+WR_SESSION_MARK <- "(^|[_-])WR([_-]|$)"
+
+wr_session_name <- function(x) grepl(WR_SESSION_MARK, x, ignore.case = TRUE)
+
+# The cold reminders, shown on the Scan panel while no capture is loaded.
+#
+# Reminders, deliberately, and not a checklist: nothing here is ticked, counted
+# or stored. The things that get forgotten are the ones done before any scan
+# exists — the label left off the tray, the exposure set by eye in Lumo, the
+# motor walked by hand — and at that moment the app has no header, no capture
+# and no state to check any of it against. Prose is the only instrument
+# available, so prose is what this is.
+#
+# It lives in the empty state rather than behind a button or a modal: it is
+# there because nothing is loaded, and it goes when something is. There is
+# nothing to dismiss, so there is nothing to learn to click past.
+#
+# Where the app *can* judge something it is not restated here — clipping belongs
+# to the Saturation panel and unwritten sidecars to the Inventory, and a second
+# copy of either could only drift from the first.
+COLD_REMINDERS <- list(
+  list(
+    when = "Before the first scan",
+    items = list(
+      "Place the label in the frame.",
+      "Set the zoom, then note the camera and stage positions — recorded once for the whole session.",
+      "Walk the motor by hand to the start and the end of the target. Those two positions are the scan.",
+      "Set the integration time in Lumo and watch the live signal stay off 100%. A reading pinned at the ceiling carries no information, so leave the detector room.",
+      "Set the capture folder, dataset name and operator now — they carry across every capture in the session."
+    )
+  ),
+  list(
+    when = "Before you keep a scan",
+    items = list(
+      "Check the field of view against the ideal this panel derives. Square pixels come from the FOV, not from a nominal number.",
+      "Screen for clipping on the Saturation panel, and look at where it clips, not only how much.",
+      "Record the motor start and stop for this capture."
+    )
+  ),
+  list(
+    when = "Before you leave",
+    items = list(
+      "Run a separate white-reference session at a lower integration time. Give it the dataset name _WR_ followed by the date, as in _WR_2026-09-12, so every session sorts to the top of the sensor folder.",
+      "Copy that session's reference into every capture's WHITEREF folder, so each capture carries both exposures: the matched one at the specimen's integration time and the unsaturated one from the WR session.",
+      "Write a sidecar for every capture. The Inventory panel counts the ones you have not."
+    )
+  )
 )
 
 # The scan's five numbers and the band count are all short — the widest real
@@ -444,6 +609,9 @@ nz <- function(v) {
 # ==========================================================================
 
 ui <- bslib::page_navbar(
+  # Named so the Inventory's Load button can hand the operator over to the Scan
+  # panel it just filled in.
+  id = "main_nav",
   # The chrome band, in the palette's own plum rather than the hue-rotated one:
   # a large surface wants less saturation than a small accent, and this keeps
   # the app's two loud colours — blue for commit, red for destroy — spent on
@@ -577,6 +745,14 @@ ui <- bslib::page_navbar(
 
   bslib::nav_panel(
     title = "Scan",
+
+    # ---- The cold state: reminders until a capture is loaded -------------
+    # Pinned to its own height. A nav panel lays its children out as flex items,
+    # and `fill = FALSE` sizes the *card* to its content without helping the
+    # uiOutput wrapper around it — which stays a shrinkable item and collapses
+    # the card to nothing. The card renders either way; it is simply zero pixels
+    # tall, which is a long way from an obvious symptom.
+    shiny::uiOutput("cold_reminders", style = "flex: 0 0 auto;"),
 
     # ---- Card 1: the scan and its geometry -------------------------------
     bslib::card(
@@ -1045,7 +1221,10 @@ ui <- bslib::page_navbar(
           "region of interest and keep the tape and tray out of the count;",
           "release outside the image to screen the full frame. The preview is",
           "decimated and its aspect ratio is deliberately broken — axes are",
-          "line and sample indices."
+          "line and sample indices. After a screen, overexposed pixels are",
+          "washed over the preview in red, darker where more of the area clips:",
+          "clipping on the specimen means recapture, clipping confined to the",
+          "tray or a column of hot pixels means screen a tighter region instead."
         ),
         shiny::div(
           class = "flex-grow-1",
@@ -1053,7 +1232,12 @@ ui <- bslib::page_navbar(
           shiny::plotOutput(
             "sat_preview_plot",
             height = "100%",
-            brush = shiny::brushOpts(id = "sat_brush", resetOnNew = TRUE)
+            # The brush outlives a redraw, because finishing a screen redraws the
+            # plot to wash the map over it and resetting here would take the
+            # region of interest away at the moment its result appears. A brush
+            # is only ever stale across captures, and the load observer clears it
+            # there by hand.
+            brush = shiny::brushOpts(id = "sat_brush", resetOnNew = FALSE)
           )
         ),
         # The verdict's slot is reserved whether or not there is a verdict in it:
@@ -1123,6 +1307,49 @@ ui <- bslib::page_navbar(
             )
           )
         )
+      )
+    )
+  ),
+
+  bslib::nav_panel(
+    title = "Inventory",
+    bslib::card(
+      class = "bslib-card-box-shadow-none",
+      fill = FALSE,
+      bslib::card_header(
+        shiny::div(
+          class = "d-flex gap-3 flex-wrap align-items-center",
+          # Outlined: both of these pick something rather than change something,
+          # which is the rule the Scan panel's Load and Folder buttons follow.
+          shinyFiles::shinyDirButton(
+            "inv_dir",
+            "Choose campaign folder",
+            "Select a folder to inventory",
+            icon = bsicons::bs_icon("folder2-open"),
+            class = "btn-outline-primary"
+          ),
+          shiny::actionButton(
+            "inv_refresh",
+            "Re-read",
+            icon = bsicons::bs_icon("arrow-clockwise"),
+            class = "btn-outline-primary"
+          ),
+          shiny::div(class = "small", shiny::uiOutput("inv_summary"))
+        )
+      ),
+      bslib::card_body(
+        shiny::div(
+          class = "small text-muted mb-3",
+          "Every capture under the chosen folder, oldest first, with what the",
+          "folder holds and whether a sidecar has been written for it. Headers",
+          "and file names only — no capture is opened, so this is safe to run",
+          "while a scan is in progress. Choose a campaign or a core, not a whole",
+          "drive.",
+          shiny::br(),
+          "Load puts a capture on the Scan panel exactly as picking its .hdr",
+          "would, which is the short way back to a scan you already logged."
+        ),
+        shiny::div(class = "table-responsive", shiny::uiOutput("inv_table"))
       )
     )
   )
@@ -1225,6 +1452,7 @@ server <- function(input, output, session) {
     roots = volumes,
     filetypes = c("yaml", "yml")
   )
+  shinyFiles::shinyDirChoose(input, "inv_dir", roots = volumes)
 
   # ---- The scan --------------------------------------------------------
   # Five numbers in, four out. Each derived value is computed independently, so
@@ -1332,12 +1560,10 @@ server <- function(input, output, session) {
   })
 
   # ---- Load a scan: one pick, whole capture folder ----------------------
-  shiny::observeEvent(input$scan_hdr, {
-    fi <- shinyFiles::parseFilePaths(volumes, input$scan_hdr)
-    if (nrow(fi) == 0) {
-      return()
-    }
-    path <- fi$datapath[[1]]
+  # A function rather than the body of the file-dialog observer, because the
+  # Inventory panel loads a capture too and there must be exactly one way a
+  # capture reaches the form.
+  load_capture <- function(path) {
     hdr <- parse_hdr(path)
     if (is.null(hdr)) {
       return()
@@ -1430,6 +1656,61 @@ server <- function(input, output, session) {
         )
       }
     }
+
+    invisible(TRUE)
+  }
+
+  shiny::observeEvent(input$scan_hdr, {
+    fi <- shinyFiles::parseFilePaths(volumes, input$scan_hdr)
+    if (nrow(fi) == 0) {
+      return()
+    }
+    load_capture(fi$datapath[[1]])
+  })
+
+  # The reminders, and only while there is nothing else to look at. Loading a
+  # capture is what clears them, so they cost a returning operator one glance
+  # and a new one the thirty seconds it takes to read them.
+  output$cold_reminders <- shiny::renderUI({
+    if (!is.null(found())) {
+      return(NULL)
+    }
+
+    group <- function(g) {
+      shiny::div(
+        class = "col-md-4",
+        shiny::div(class = "fw-bold mb-1", g[["when"]]),
+        shiny::tags$ul(
+          class = "mb-0 ps-3",
+          purrr::map(g[["items"]], \(i) shiny::tags$li(class = "mb-1", i))
+        )
+      )
+    }
+
+    # Plain Bootstrap markup rather than bslib::card() and layout_columns().
+    # A card built inside renderUI() does not pick up the fill bookkeeping that
+    # the same call performs in the static UI: it came out with flex-shrink 1
+    # against the other cards' 0, and the grid inside it collapsed with it, so
+    # the whole thing rendered four thousand characters of HTML two pixels tall.
+    # These classes are Bootstrap's own, which the theme already styles and
+    # which carry no fill roles to go wrong.
+    shiny::div(
+      class = "card mb-3",
+      shiny::div(
+        class = "card-header d-flex gap-2 align-items-center",
+        bsicons::bs_icon("clipboard-check"),
+        shiny::strong("Before you start")
+      ),
+      shiny::div(
+        class = "card-body",
+        shiny::div(
+          class = "small text-muted mb-3",
+          "The things no header records and nothing here can check for you.",
+          "This goes away when you load a capture."
+        ),
+        shiny::div(class = "row", purrr::map(COLD_REMINDERS, group))
+      )
+    )
   })
 
   # What the folder gave us. DARKREF is shown but never read: a matched dark at
@@ -1450,8 +1731,13 @@ server <- function(input, output, session) {
           " not found"
         )
       } else {
+        # Blue, not green: a reference that is present is a reading that is
+        # fine, and those share a family with the Save button. Bootstrap's
+        # `success` was the one green left in an app that spends colour on two
+        # axes only, and the Inventory's own present/absent marks already use
+        # this pair.
         shiny::div(
-          class = "text-success",
+          class = "text-primary",
           bsicons::bs_icon("check-lg"),
           " ",
           shiny::span(class = "text-body", basename(path))
@@ -1765,6 +2051,31 @@ server <- function(input, output, session) {
       terra::spatSample(size = 4e5, method = "regular", as.raster = TRUE)
   })
 
+  # The map is held in its own value rather than read from sat_result() inside
+  # the plot: an eventReactive sits in a pending state until its button is
+  # pressed, so reading one there would keep the preview blank until the first
+  # screen. Loading another capture drops the map, which belongs to the capture
+  # it was measured on.
+  sat_map <- shiny::reactiveVal(NULL)
+
+  shiny::observeEvent(
+    found(),
+    {
+      sat_map(NULL)
+      # The brush is kept across redraws, so a new capture is the one place it
+      # has to go: its coordinates are line and sample indices of the capture it
+      # was drawn on, and brush_window() would clamp a stale rectangle into a
+      # plausible-looking region of the wrong scan.
+      session$resetBrush("sat_brush")
+    },
+    ignoreNULL = FALSE
+  )
+
+  shiny::observeEvent(sat_result(), {
+    res <- sat_result()
+    sat_map(if (inherits(res, "error")) NULL else res[["map"]])
+  })
+
   # Long axis horizontal, aspect deliberately broken: a 24339 x 2184 strip drawn
   # true to scale is either an unusable ribbon or an endless scroll. Plot units
   # are full-resolution line and sample indices, so brush coordinates arrive in
@@ -1804,6 +2115,35 @@ server <- function(input, output, session) {
       asp = NA
     )
     graphics::rasterImage(img, 0, n_sample, n_line, 0, interpolate = FALSE)
+
+    # The clipped pixels, washed over the image they came from. Each block keeps
+    # its own box, so the blocks draw independently and no ragged aggregation
+    # edge has to line up with its neighbour's.
+    purrr::walk(sat_map(), \(block) {
+      frac <- pmin(block[["map"]] / block[["map_cell"]], 1)
+      wash <- grDevices::rgb(
+        MAP_RGB[[1]],
+        MAP_RGB[[2]],
+        MAP_RGB[[3]],
+        alpha = round(
+          255 *
+            ifelse(frac > 0, MAP_ALPHA_FLOOR + MAP_ALPHA_RANGE * sqrt(frac), 0)
+        ),
+        maxColorValue = 255
+      ) |>
+        matrix(nrow = nrow(frac), ncol = ncol(frac))
+
+      # Transposed on the way out, the same swap the preview makes: the plot's x
+      # is the line and its y is the sample, while the matrix runs the other way.
+      graphics::rasterImage(
+        t(wash),
+        block[["map_box"]][[1]],
+        block[["map_box"]][[4]],
+        block[["map_box"]][[2]],
+        block[["map_box"]][[3]],
+        interpolate = FALSE
+      )
+    })
   })
 
   sat_result <- shiny::eventReactive(input$sat_run, {
@@ -1848,6 +2188,16 @@ server <- function(input, output, session) {
     n_block <- max(1, min(12, floor((y_max - y_min) / 200)))
     edges <- round(seq(y_max, y_min, length.out = n_block + 1))
 
+    # One cell size for the whole region, so the map reads as one image rather
+    # than as twelve differently-scaled strips. `fact` is c(rows, columns) here
+    # — the aggregation factor is documented as "horizontally and vertically"
+    # but applies the first element to rows, which is worth knowing before
+    # debugging a transposed map.
+    fact <- c(
+      max(1, floor((y_max - y_min) / MAP_LINES)),
+      max(1, floor((x_max - x_min) / MAP_SAMPLES))
+    )
+
     message <- if (step == 1L) {
       "Reading every band"
     } else {
@@ -1875,6 +2225,19 @@ server <- function(input, output, session) {
               limit = limit,
               collapse = TRUE
             )
+            # Aggregated rather than summed outright. terra::aggregate() with
+            # fun = "sum" counts the clipped pixels per coarse cell, so summing
+            # the cells returns exactly what terra::global() returned — the
+            # reported percentage is unchanged — and the grid it produces is the
+            # map. Measured at the same time as the plain sum, because the cost
+            # here is the read and not the reduction.
+            counts <- terra::aggregate(
+              mask,
+              fact = fact,
+              fun = "sum",
+              na.rm = TRUE
+            )
+
             # Dimensions come back from the windowed raster, never from the
             # brush: terra snaps the window to cell boundaries, and the brush
             # rectangle is fractional.
@@ -1882,7 +2245,21 @@ server <- function(input, output, session) {
               rows = terra::nrow(x),
               cols = terra::ncol(x),
               cells = terra::ncell(x),
-              saturated = terra::global(mask, "sum", na.rm = TRUE)[[1]]
+              saturated = sum(terra::values(counts), na.rm = TRUE),
+              # Values and a box, not the SpatRaster: a SpatRaster carries a
+              # pointer and a window, and nothing outside this loop should hold
+              # either. Row 1 of the matrix is the ymax edge and column 1 the
+              # xmin edge (both verified by strip identity), and the raster's y
+              # runs against the line index, so the box is handed over already
+              # in the plot's own line/sample coordinates.
+              map = terra::as.matrix(counts, wide = TRUE),
+              map_box = c(
+                n_line - terra::ymax(counts),
+                n_line - terra::ymin(counts),
+                terra::xmin(counts),
+                terra::xmax(counts)
+              ),
+              map_cell = prod(fact)
             )
 
             shiny::incProgress(
@@ -1903,7 +2280,8 @@ server <- function(input, output, session) {
             saturated = sum(purrr::map_dbl(screened, "saturated")),
             roi = !is.null(roi),
             bands = length(bands),
-            n_band = n_band
+            n_band = n_band,
+            map = purrr::map(screened, \(b) b[c("map", "map_box", "map_cell")])
           )
         },
         error = \(e) e
@@ -1983,6 +2361,232 @@ server <- function(input, output, session) {
       )
     )
   })
+
+  # ---- Inventory: the whole campaign, and what is still unlogged ---------
+  # hsical is the metadata logger, and the question it could not answer was the
+  # one asked at the end of a scanning day: which of these captures did I
+  # actually write a sidecar for. The panel answers it by reading headers and
+  # file names only.
+
+  inventory <- shiny::reactiveVal(NULL)
+  inv_root <- shiny::reactiveVal(NULL)
+
+  read_inventory <- function(root) {
+    shiny::withProgress(
+      message = "Reading capture headers",
+      value = 0.5,
+      inventory(scan_inventory(root))
+    )
+  }
+
+  shiny::observeEvent(input$inv_dir, {
+    root <- shinyFiles::parseDirPath(volumes, input$inv_dir)
+    if (!length(root) || !nzchar(root)) {
+      return()
+    }
+    inv_root(root)
+    read_inventory(root)
+  })
+
+  # Saving a sidecar does not tell this panel anything, so the operator says so.
+  shiny::observeEvent(input$inv_refresh, {
+    root <- inv_root()
+    shiny::req(root)
+    read_inventory(root)
+  })
+
+  output$inv_summary <- shiny::renderUI({
+    inv <- inventory()
+    if (is.null(inv)) {
+      return(shiny::span(class = "text-muted", "No folder chosen."))
+    }
+    if (length(inv) == 0) {
+      return(shiny::span(class = "text-muted", "No captures found."))
+    }
+
+    logged <- sum(purrr::map_lgl(inv, \(r) !is.null(r[["sidecar"]])))
+    missing <- length(inv) - logged
+
+    shiny::tagList(
+      shiny::strong(length(inv)),
+      if (length(inv) == 1) " capture" else " captures",
+      " · ",
+      shiny::strong(logged),
+      " logged · ",
+      # The one number the panel exists to show, so it is the one that carries
+      # colour: red while anything is unlogged, and the ordinary body colour the
+      # moment nothing is.
+      shiny::span(
+        class = if (missing > 0) "text-danger fw-bold" else NULL,
+        missing,
+        " without a sidecar"
+      )
+    )
+  })
+
+  output$inv_table <- shiny::renderUI({
+    inv <- inventory()
+    if (is.null(inv)) {
+      return(shiny::span(
+        class = "text-muted",
+        "Choose a folder to inventory."
+      ))
+    }
+    if (length(inv) == 0) {
+      return(shiny::span(
+        class = "text-muted",
+        "No captures under that folder. A capture is a .hdr inside a capture/ folder."
+      ))
+    }
+
+    # Present is the blue of a reading that is fine, absent the red of one that
+    # is not — the app's two status colours, spent here exactly as elsewhere.
+    mark <- function(present, label) {
+      shiny::span(
+        class = paste("me-2", if (present) "text-primary" else "text-danger"),
+        bsicons::bs_icon(if (present) "check-lg" else "x-lg"),
+        " ",
+        label
+      )
+    }
+
+    num <- function(v) if (is.null(v) || is.na(v)) "—" else format(v)
+
+    rows <- purrr::imap(inv, \(r, i) {
+      h <- r[["hdr"]]
+
+      shiny::tags$tr(
+        shiny::tags$td(
+          shiny::div(basename(r[["scan_root"]])),
+          shiny::div(
+            class = "small text-muted",
+            paste(
+              num(h[["acquisition_date"]]),
+              if (is.na(h[["start_time"]])) "" else h[["start_time"]]
+            ),
+            # A white-reference session is a different kind of scan, and saying
+            # so here stops it reading as a core someone forgot to log.
+            if (r[["is_wr"]]) {
+              shiny::span(class = "ms-1", "· white-reference session")
+            }
+          )
+        ),
+        shiny::tags$td(num(h[["camera"]])),
+        shiny::tags$td(
+          class = "small",
+          sprintf(
+            "%s × %s × %s",
+            num(h[["lines"]]),
+            num(h[["samples"]]),
+            num(h[["bands"]])
+          )
+        ),
+        shiny::tags$td(
+          class = "small",
+          if (is.na(h[["tint"]])) "—" else paste(round(h[["tint"]], 2), "ms")
+        ),
+        shiny::tags$td(
+          class = "small text-nowrap",
+          mark(r[["white"]], "WR"),
+          mark(r[["dark"]], "DR"),
+          mark(r[["log"]], "log")
+        ),
+        shiny::tags$td(
+          class = "small",
+          # Reported without a verdict: the marker this is found under is one
+          # campaign's naming habit, so an empty cell is a fact about the folder
+          # and not a fault in the scan.
+          if (r[["is_wr"]]) {
+            shiny::span(class = "text-muted", "—")
+          } else if (is.null(r[["wr_session"]])) {
+            shiny::span(class = "text-muted", "none found")
+          } else {
+            r[["wr_session"]]
+          }
+        ),
+        shiny::tags$td(
+          class = "small",
+          if (is.null(r[["sidecar"]])) {
+            shiny::span(
+              class = "text-danger",
+              bsicons::bs_icon("x-lg"),
+              " not written"
+            )
+          } else {
+            shiny::span(
+              class = "text-primary",
+              bsicons::bs_icon("check-lg"),
+              " ",
+              basename(r[["sidecar"]])
+            )
+          }
+        ),
+        shiny::tags$td(
+          # The row index travels, not the path: an integer needs no escaping on
+          # its way through JavaScript, and the server is holding the very list
+          # it indexes into. `priority: "event"` so loading the same row twice
+          # fires twice — an unchanged value is not a reason to do nothing here.
+          shiny::tags$button(
+            class = "btn btn-sm btn-outline-primary",
+            onclick = sprintf(
+              "Shiny.setInputValue('inv_load', %d, {priority: 'event'});",
+              i
+            ),
+            "Load"
+          )
+        )
+      )
+    })
+
+    shiny::tags$table(
+      class = "table table-sm align-middle",
+      shiny::tags$thead(shiny::tags$tr(
+        shiny::tags$th("Capture"),
+        shiny::tags$th("Sensor"),
+        shiny::tags$th("Lines × samples × bands"),
+        shiny::tags$th("ET"),
+        shiny::tags$th("References"),
+        shiny::tags$th("WR session"),
+        shiny::tags$th("Sidecar"),
+        shiny::tags$th("")
+      )),
+      shiny::tags$tbody(rows)
+    )
+  })
+
+  shiny::observeEvent(input$inv_load, {
+    inv <- inventory()
+    i <- input$inv_load
+    shiny::req(inv, i >= 1, i <= length(inv))
+
+    load_capture(inv[[i]][["path"]])
+    # Straight to the panel that just filled in, because loading a capture is
+    # only ever the first half of what the operator came to do.
+    bslib::nav_select("main_nav", "Scan", session = session)
+  })
+
+  # The Scan panel's state can now change while the Scan panel is off screen:
+  # the Inventory's Load fills the form and switches tabs inside one observer.
+  # An output on a hidden tab is suspended, and a suspension that starts before
+  # the value changes and ends with a programmatic nav_select in the same flush
+  # leaves the output stale — the form arrived filled in while the discovery
+  # list, the save target and the reminders still described an empty app.
+  # Loading through the file dialog never showed it, because that path does not
+  # move the operator between tabs.
+  #
+  # These five render text and small markup, so never suspending them costs
+  # nothing. Declared here rather than beside each output because
+  # shiny::outputOptions() requires the output to exist already.
+  purrr::walk(
+    c(
+      "discovery",
+      "save_target",
+      "cold_reminders",
+      "spectral_chip",
+      "cal_pack_note"
+    ),
+    \(id) shiny::outputOptions(output, id, suspendWhenHidden = FALSE)
+  )
 }
 
 shiny::shinyApp(ui, server)
