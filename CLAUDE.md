@@ -121,7 +121,7 @@ CLAUDE.md; everything time-bound goes in dated docs — never in CLAUDE.md.
 - Run: `hsical::run_app()` in R, or `inst/launch/hsical.cmd` on Windows.
 - **Inspecting HSItools internals:** `library(HSItools)` pulls in `terra`, whose native
   DLLs **segfault** under the Git-Bash `Rscript` in this environment. Run R through
-  **PowerShell** (`& "C:\Program Files\R\R-4.6.0\bin\Rscript.exe"`) instead. To read a
+  **PowerShell** (`& "C:\Program Files\R\R-4.6.1\bin\Rscript.exe"`) instead. To read a
   compiled function without attaching: `deparse(get(f, asNamespace("HSItools")))`.
 - `README.md` was refreshed to v2.1 (2026-07-15). If the app changes again, keep it in
   step; on any doubt, `DESCRIPTION`, `app.R`, and the interface contract are ground truth.
