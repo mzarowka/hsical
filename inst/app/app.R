@@ -363,6 +363,13 @@ WR_SESSION_MARK <- "(^|[_-])WR([_-]|$)"
 
 wr_session_name <- function(x) grepl(WR_SESSION_MARK, x, ignore.case = TRUE)
 
+# Frame counts run to five digits, and they are read at a glance off a screen
+# beside an instrument. Spaced, and never in scientific notation, which is what
+# format() reaches for on a plain double.
+fmt_count <- function(n) {
+  format(n, big.mark = " ", scientific = FALSE, trim = TRUE)
+}
+
 # The cold reminders, shown on the Scan panel while no capture is loaded.
 #
 # Reminders, deliberately, and not a checklist: nothing here is ticked, counted
@@ -1430,6 +1437,10 @@ server <- function(input, output, session) {
   # What the last capture .hdr pick turned up in its folder.
   found <- shiny::reactiveVal(NULL)
 
+  # What the capture's .log said about frames. Held rather than re-read, so the
+  # dropped-frame verdict and the form field come from one parse of one file.
+  frames <- shiny::reactiveVal(NULL)
+
   # Default sidecar folder: the scan root (parent of the capture/ folder that
   # holds the .hdr), overridable via the Folder… button.
   save_dir <- shiny::reactiveVal(NULL)
@@ -1646,15 +1657,44 @@ server <- function(input, output, session) {
       }
     }
 
-    if (!is.null(cap$log)) {
-      lg <- parse_log(cap$log)
-      if (!is.na(lg[["dropped"]])) {
-        shiny::updateNumericInput(
-          session,
-          "dropped_frames",
-          value = lg[["dropped"]]
-        )
-      }
+    lg <- if (is.null(cap$log)) NULL else parse_log(cap$log)
+    frames(lg)
+
+    # The field follows the log, including when there is no log to follow. The
+    # count is only written under the condition that produced it, so leaving the
+    # previous capture's number sitting in the field is how a sidecar ends up
+    # recording another scan's dropped frames — the quiet failure the log search
+    # was rewritten this morning to avoid.
+    shiny::updateNumericInput(
+      session,
+      "dropped_frames",
+      value = if (is.null(lg) || is.na(lg[["dropped"]])) NA else lg[["dropped"]]
+    )
+
+    # Interrupts only when there is something to interrupt for. A dropped frame
+    # is a line the stage moved past without the sensor recording it, so the
+    # along-track geometry is locally wrong — and the moment worth knowing that
+    # is this one, while the core is still on the stage, rather than later on
+    # the way past the QC group. The discovery list keeps the same verdict where
+    # it can be re-read; this is the part that arrives whether or not anyone was
+    # looking at that corner of the screen.
+    #
+    # One id, so loading the next capture replaces this verdict instead of
+    # stacking beside it. A notification that outlives the capture it describes
+    # is worse than none.
+    if (!is.null(lg) && !is.na(lg[["dropped"]]) && lg[["dropped"]] > 0) {
+      shiny::showNotification(
+        paste0(
+          fmt_count(lg[["dropped"]]),
+          if (lg[["dropped"]] == 1) " dropped frame" else " dropped frames",
+          " in this capture — see the .log line above the form."
+        ),
+        id = "dropped_frames_note",
+        type = "error",
+        duration = NULL
+      )
+    } else {
+      shiny::removeNotification("dropped_frames_note")
     }
 
     invisible(TRUE)
@@ -1744,11 +1784,60 @@ server <- function(input, output, session) {
         )
       }
     }
+    # The .log's frame count as a verdict rather than as a number waiting in a
+    # form field. Nothing is shown when there is no log to read it from — the
+    # row above already says why.
+    #
+    # Two states and no tiers. Any dropped frame is a real defect, and where the
+    # line falls between a blemish and a recapture depends on what the scan is
+    # for; the count and the share are both given so that call stays with the
+    # operator. A threshold invented here would only have hidden it.
+    dropped_row <- function(lg) {
+      if (is.null(lg) || is.na(lg[["dropped"]])) {
+        return(NULL)
+      }
+
+      n <- lg[["dropped"]]
+      recorded <- lg[["recorded"]]
+
+      if (n == 0) {
+        return(shiny::div(
+          class = "text-primary mt-1",
+          bsicons::bs_icon("check-lg"),
+          " no dropped frames",
+          if (!is.na(recorded)) {
+            shiny::span(
+              class = "text-body",
+              paste(" in", fmt_count(recorded), "recorded")
+            )
+          }
+        ))
+      }
+
+      shiny::div(
+        class = "text-danger fw-bold mt-1",
+        bsicons::bs_icon("exclamation-triangle"),
+        " ",
+        paste(
+          fmt_count(n),
+          if (n == 1) "dropped frame" else "dropped frames"
+        ),
+        if (!is.na(recorded) && recorded > 0) {
+          sprintf(
+            " of %s recorded (%.2f%%)",
+            fmt_count(recorded),
+            100 * n / recorded
+          )
+        }
+      )
+    }
+
     shiny::tagList(
       row("capture", cap$target),
       row("WHITEREF", cap$white),
       row("DARKREF", cap$dark),
-      row(".log", cap$log)
+      row(".log", cap$log),
+      dropped_row(frames())
     )
   })
 
@@ -1864,6 +1953,7 @@ server <- function(input, output, session) {
         shiny::updateNumericInput(session, id, value = NA)
       })
       spectral(NULL)
+      frames(NULL)
       found(NULL)
     }
   })
