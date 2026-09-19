@@ -203,6 +203,51 @@ discover_capture <- function(hdr_path) {
   )
 }
 
+# The white-reference session a capture was calibrated against, nested first and
+# sibling second — the order the processing runbook's inventory uses, so the lab
+# has one answer to "which WR goes with this core".
+#
+# Nested is lab practice from 2026: the WR session is copied into
+# <capture>/whiteref/, either flat (whiteref/capture/, as on 2026-09-19) or under
+# its own folder (whiteref/<WR>/capture/, as on 2026-07-18). A reference-only WR
+# session holds nothing but its WHITEREF_/DARKREF_ files, so the session's name
+# is read off the WHITEREF_ file rather than off any folder. More than one
+# distinct name is reported as ambiguous instead of quietly taking the first.
+#
+# Sibling is the older layout (GKUT25_01_WR_<stamp> beside GKUT25_01_<stamp>),
+# kept so archive data still reads. Returns list(names, rule), rule being
+# "nested", "ambiguous", "sibling" or NULL when nothing is found.
+find_wr_session <- function(scan_root) {
+  nested <- list.files(
+    file.path(scan_root, "whiteref"),
+    pattern = "^WHITEREF_.*\\.hdr$",
+    recursive = TRUE,
+    full.names = TRUE,
+    ignore.case = TRUE
+  )
+  nested <- nested[tolower(basename(dirname(nested))) == "capture"]
+  names <- nested |>
+    basename() |>
+    tools::file_path_sans_ext() |>
+    sub(pattern = "^WHITEREF_", replacement = "", ignore.case = TRUE) |>
+    unique()
+
+  if (length(names) == 1) {
+    return(list(names = names, rule = "nested"))
+  }
+  if (length(names) > 1) {
+    return(list(names = names, rule = "ambiguous"))
+  }
+
+  siblings <- basename(list.dirs(dirname(scan_root), recursive = FALSE))
+  siblings <- siblings[wr_session_name(siblings)]
+
+  if (length(siblings) == 0) {
+    return(list(names = NULL, rule = NULL))
+  }
+  list(names = siblings[[1]], rule = "sibling")
+}
+
 # Every capture under a folder, with what has and has not been logged for each.
 # Header text and file existence only — no capture is ever opened — so a
 # campaign of fifty scans costs fifty small text reads and the panel stays
@@ -218,9 +263,13 @@ scan_inventory <- function(root) {
 
   # A capture is a .hdr in a `capture/` folder that is not one of the two
   # references standing beside it — the same shape discover_capture() assumes.
+  # Nothing under a whiteref/ folder is a capture of its own: it is a reference
+  # copied into the capture above it, and a copy that carries a full scan of
+  # the tile would otherwise add a row per core it was copied into.
   hdrs <- hdrs[
     basename(dirname(hdrs)) == "capture" &
-      !grepl("^(WHITEREF|DARKREF)_", basename(hdrs), ignore.case = TRUE)
+      !grepl("^(WHITEREF|DARKREF)_", basename(hdrs), ignore.case = TRUE) &
+      !grepl("/whiteref/", hdrs, ignore.case = TRUE)
   ]
 
   # One row per capture, not one per path that reaches it. list.files() walks
@@ -240,15 +289,7 @@ scan_inventory <- function(root) {
     # back is what makes this an inventory rather than a file listing.
     sidecar <- file.path(cap[["scan_root"]], paste0(name, ".yaml"))
 
-    # The white-reference session is a scan of its own, in a folder beside this
-    # one under the same sensor. Reported, never judged: the marker below is a
-    # naming habit observed in one campaign, and one campaign is not evidence
-    # enough to fault a capture for not matching it.
-    siblings <- basename(list.dirs(
-      dirname(cap[["scan_root"]]),
-      recursive = FALSE
-    ))
-    wr <- siblings[wr_session_name(siblings)]
+    wr <- find_wr_session(cap[["scan_root"]])
 
     list(
       path = path,
@@ -259,7 +300,8 @@ scan_inventory <- function(root) {
       dark = !is.null(cap[["dark"]]),
       log = !is.null(cap[["log"]]),
       is_wr = wr_session_name(name),
-      wr_session = if (length(wr) == 0) NULL else wr[[1]],
+      wr_session = wr[["names"]],
+      wr_rule = wr[["rule"]],
       sidecar = if (file.exists(sidecar)) sidecar else NULL
     )
   })
@@ -351,13 +393,13 @@ MAP_ALPHA_RANGE <- 0.7
 # the specimen's integration time and clips by design, so the usable reference
 # is this other scan.
 #
-# Lab policy from 2026-09-12 is a `_WR_` prefix and the date as the dataset
-# name, giving `_WR_2026-09-12_<time>` — every session then sorts to the top of
-# the sensor folder. The archive does not look like that: years of captures mark
-# the session in every imaginable way, so this matches WR as a *token* rather
-# than at a fixed position — any case, bounded by an underscore, a hyphen or the
-# ends of the name. That finds the policy form, the older infixed
-# `GKUT25_01_WR_<timestamp>`, and a bare `WR_...`, while still refusing the
+# Lab rule (2026-09-19): the dataset name is `WR_` and the date, so Lumo writes
+# `WR_2026-09-19_<time>` — what every session since July 2026 is already called.
+# The originals live in <country>/_WHITEREF/<sensor>/ and a copy goes into each
+# capture's whiteref/. The archive before that marks the session in every
+# imaginable way, mostly after the core (`GKUT25_01_WR_<timestamp>`), so this
+# matches WR as a *token* rather than at a fixed position — any case, bounded by
+# an underscore, a hyphen or the ends of the name — while still refusing the
 # letters inside a word: a core from Wrocław does not become a white reference.
 WR_SESSION_MARK <- "(^|[_-])WR([_-]|$)"
 
@@ -390,6 +432,11 @@ COLD_REMINDERS <- list(
   list(
     when = "Before the first scan",
     items = list(
+      # First because it is the only item with a measured cause behind it: the
+      # SWIR captures that lost exactly 925 frames did so while Windows Update's
+      # BITS service was active (2026-09-19, event 7040 inside the drop window).
+      # Active hours do not help — they stop restarts, not downloads.
+      "Pause Windows Update on the scan PC. Background update downloads starve the recorder and drop frames; active hours alone do not stop them.",
       "Place the label in the frame.",
       "Set the zoom, then note the camera and stage positions — recorded once for the whole session.",
       "Walk the motor by hand to the start and the end of the target. Those two positions are the scan.",
@@ -408,8 +455,8 @@ COLD_REMINDERS <- list(
   list(
     when = "Before you leave",
     items = list(
-      "Run a separate white-reference session at a lower integration time. Give it the dataset name _WR_ followed by the date, as in _WR_2026-09-12, so every session sorts to the top of the sensor folder.",
-      "Copy that session's reference into every capture's WHITEREF folder, so each capture carries both exposures: the matched one at the specimen's integration time and the unsaturated one from the WR session.",
+      "Run a separate white-reference session at a lower integration time. Give it the dataset name WR_ followed by the date, as in WR_2026-09-19, and keep the original in the _WHITEREF folder.",
+      "Copy that session into a whiteref folder beside each capture's capture folder, so each capture carries both exposures: the matched one at the specimen's integration time and the unsaturated one from the WR session.",
       "Write a sidecar for every capture. The Inventory panel counts the ones you have not."
     )
   )
@@ -2583,15 +2630,38 @@ server <- function(input, output, session) {
         ),
         shiny::tags$td(
           class = "small",
-          # Reported without a verdict: the marker this is found under is one
-          # campaign's naming habit, so an empty cell is a fact about the folder
-          # and not a fault in the scan.
+          # Reported without a verdict, and with where it was found: a copy
+          # inside the capture is the lab's practice and says the operator put
+          # it there, while a sibling is only a folder that happens to sit
+          # nearby. Several copies disagree with each other, so that one earns
+          # the caution colour — hsical cannot know which the operator meant.
           if (r[["is_wr"]]) {
             shiny::span(class = "text-muted", "—")
           } else if (is.null(r[["wr_session"]])) {
             shiny::span(class = "text-muted", "none found")
+          } else if (identical(r[["wr_rule"]], "ambiguous")) {
+            shiny::span(
+              class = "text-warning",
+              title = paste(r[["wr_session"]], collapse = "\n"),
+              bsicons::bs_icon("exclamation-triangle"),
+              paste0(
+                " ",
+                length(r[["wr_session"]]),
+                " different WR in whiteref/"
+              )
+            )
           } else {
-            r[["wr_session"]]
+            shiny::tagList(
+              r[["wr_session"]],
+              shiny::span(
+                class = "text-muted",
+                if (identical(r[["wr_rule"]], "nested")) {
+                  " (in capture)"
+                } else {
+                  " (beside)"
+                }
+              )
+            )
           }
         ),
         shiny::tags$td(
