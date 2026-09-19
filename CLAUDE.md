@@ -123,7 +123,7 @@ CLAUDE.md; everything time-bound goes in dated docs — never in CLAUDE.md.
   DLLs **segfault** under the Git-Bash `Rscript` in this environment. Run R through
   **PowerShell** (`& "C:\Program Files\R\R-4.6.1\bin\Rscript.exe"`) instead. To read a
   compiled function without attaching: `deparse(get(f, asNamespace("HSItools")))`.
-- `README.md` was refreshed to v2.1 (2026-07-15). If the app changes again, keep it in
+- `README.md` was refreshed to v2.2 (2026-09-19). If the app changes again, keep it in
   step; on any doubt, `DESCRIPTION`, `app.R`, and the interface contract are ground truth.
 
 ## Housekeeping
