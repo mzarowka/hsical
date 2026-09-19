@@ -13,8 +13,12 @@ ecosystem file wins.
 CRAN-quality). **zarowka** = front-end scaffolding where new functions are battle-
 tested before promotion to HSItools. **hsical** = this repo: a standalone, packaged
 Shiny app (`hsical::run_app()`) that is the scan-session calibration companion and
-metadata logger. **hsical never touches spectral data** — no reflectance, no masking,
-no co-registration. It collects field values and writes a metadata sidecar.
+metadata logger. **hsical never processes spectral data** — no reflectance, no masking,
+no co-registration, no raster written. It collects field values and writes a metadata
+sidecar. The one exception, narrowed deliberately on 2026-09-12: the Saturation panel
+**reads raw DN for diagnostics and display only** — screening the loaded capture through
+`HSItools::hsi_check_saturation()` and mapping where it clips. Nothing it reads is written
+anywhere, and no spectral value (`saturation_ratio` included) enters the sidecar.
 
 ## How to work here (behavioral rules — these outrank the code specifics)
 
