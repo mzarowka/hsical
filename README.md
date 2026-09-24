@@ -48,12 +48,15 @@ Load one capture `.hdr` and HSIcal discovers the rest of the scan folder — the
 `WHITEREF` and `DARKREF` siblings and the Lumo `.log` matched by the capture's own name —
 from that single pick, and autofills what the files already know (`lines`, `samples`,
 `bands`, integration times, frame rate, binning, lens and calibration pack, dropped frames,
-and the full wavelength / FWHM axes).
+and the full wavelength / FWHM axes). Loading describes the capture: a value its files do not
+provide is cleared, never carried over from the previous capture.
 
 **Dropped frames are flagged**, not just filled in: the discovery list states the count and
 share of recorded frames (in red when any were lost), and a notification appears at load.
-A dropped frame is a line the stage moved past unrecorded, so the scan should be judged at
-the rig while the core is still on the stage.
+From the capture's own scan clock it also says whether the stage kept moving through the gap,
+what the true pixel size would be, and where the missing lines sit — as information only.
+`yres` in the sidecar is always scan length ÷ recorded lines. A capture that dropped frames
+should be rescanned, and judged at the rig while the core is still on the stage.
 
 A scan is **five numbers**: lines, samples, start position, stop position, and field of
 view. Everything else is derived and shown live, never typed:
@@ -103,6 +106,12 @@ The white-reference session is looked for **inside the capture first** — a cop
 `<capture>/whiteref/` — and beside it second, for older layouts. Several different copies
 in one capture are reported as ambiguous rather than resolved silently. Captures reached
 twice through a Windows junction are listed once.
+
+**The odd one out is flagged.** Within a session (one sensor, one acquisition date, three or
+more captures), a capture whose white-reference integration time, binning or calibration pack
+differs from the session's usual value is marked in amber, with what the others use — a
+30 ms white reference among 3 ms ones, say. The specimen integration time is shown but not
+flagged, since it legitimately changes from core to core.
 
 **Load** puts any row on the Scan panel exactly as picking its `.hdr` would.
 

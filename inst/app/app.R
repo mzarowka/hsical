@@ -216,17 +216,28 @@ clock_gap <- function(hdr, lg) {
   }
   stop <- if (is.na(hdr[["stop_time"]])) NA_real_ else secs(hdr[["stop_time"]])
 
-  if (anyNA(c(fps, recorded, start, stop)) || fps <= 0) {
+  if (is.na(fps) || fps <= 0) {
     return(list(verdict = "no_times", drop_s = NA_real_))
   }
 
+  # Checked before the clock is needed: a gap this short changes the pixel size
+  # by a fraction of a percent whatever the clock says, and older Lumo headers
+  # (2022) carry no Start/Stop Time at all.
   drop_s <- dropped / fps
+  if (drop_s < 2 * CLOCK_TOLERANCE_S) {
+    return(list(verdict = "too_short", drop_s = drop_s))
+  }
+
+  if (anyNA(c(recorded, start, stop))) {
+    return(list(verdict = "no_times", drop_s = drop_s))
+  }
+
   # A scan that runs past midnight UTC wraps the clock.
   duration <- (stop - start) %% 86400
 
-  verdict <- if (drop_s < 2 * CLOCK_TOLERANCE_S) {
-    "too_short"
-  } else if (abs(duration - (recorded + dropped) / fps) <= CLOCK_TOLERANCE_S) {
+  verdict <- if (
+    abs(duration - (recorded + dropped) / fps) <= CLOCK_TOLERANCE_S
+  ) {
     "moved"
   } else if (abs(duration - recorded / fps) <= CLOCK_TOLERANCE_S) {
     "clock_excludes"
@@ -307,7 +318,7 @@ find_wr_session <- function(scan_root) {
     unique()
 
   if (length(names) == 1) {
-    return(list(names = names, rule = "nested"))
+    return(list(names = names, rule = "nested", white_hdr = nested[[1]]))
   }
   if (length(names) > 1) {
     return(list(names = names, rule = "ambiguous"))
@@ -319,7 +330,96 @@ find_wr_session <- function(scan_root) {
   if (length(siblings) == 0) {
     return(list(names = NULL, rule = NULL))
   }
-  list(names = siblings[[1]], rule = "sibling")
+  # The sibling session's own white reference, for its integration time.
+  white <- list.files(
+    file.path(dirname(scan_root), siblings[[1]], "capture"),
+    pattern = "^WHITEREF_.*\\.hdr$",
+    full.names = TRUE,
+    ignore.case = TRUE
+  )
+  list(
+    names = siblings[[1]],
+    rule = "sibling",
+    white_hdr = if (length(white) == 0) NULL else white[[1]]
+  )
+}
+
+# Marks the capture that differs from the rest of its session. A session is one
+# sensor on one acquisition date; white-reference sessions are left out, since
+# their exposure is meant to differ. Only settings that should hold for a whole
+# session are compared — the white-reference exposure, binning and calibration
+# pack. The specimen's own integration time legitimately changes from core to
+# core, so it is shown in the table but never flagged.
+#
+# "Differs" means differs from the session's most common value, with no
+# threshold: a 30 ms white reference among 3 ms ones and a 3.5 ms one are both
+# worth a look, and it is information, not a verdict. A session needs three
+# captures and a strict majority, or there is nothing to be odd against.
+#
+# Adds `odd`, a character vector of findings (empty when the capture agrees).
+flag_odd <- function(records) {
+  fields <- list(
+    `WR ET` = \(r) {
+      v <- r[["wr_et"]]
+      if (is.na(v)) NA_character_ else paste(round(v, 2), "ms")
+    },
+    binning = \(r) {
+      s <- r[["hdr"]][["spectral_binning"]]
+      p <- r[["hdr"]][["spatial_binning"]]
+      if (is.na(s) || is.na(p)) NA_character_ else paste0(s, "/", p)
+    },
+    `calibration pack` = \(r) r[["hdr"]][["calibration_pack"]]
+  )
+
+  session <- purrr::map_chr(records, \(r) {
+    if (r[["is_wr"]]) {
+      return(NA_character_)
+    }
+    paste(r[["hdr"]][["camera"]], r[["hdr"]][["acquisition_date"]])
+  })
+
+  # One row per finding: which record, and what to say about it.
+  findings <- unique(stats::na.omit(session)) |>
+    purrr::map(\(key) {
+      members <- which(session == key)
+      if (length(members) < 3) {
+        return(NULL)
+      }
+      purrr::imap(fields, \(get, label) {
+        values <- purrr::map_chr(records[members], get)
+        counts <- sort(table(values[!is.na(values)]), decreasing = TRUE)
+        if (length(counts) < 2 || counts[[1]] == counts[[2]]) {
+          return(NULL)
+        }
+        usual <- names(counts)[[1]]
+        off <- members[!is.na(values) & values != usual]
+        data.frame(
+          i = off,
+          text = sprintf(
+            "%s %s — others %s (%d captures)",
+            label,
+            values[match(off, members)],
+            usual,
+            counts[[1]]
+          )
+        )
+      }) |>
+        purrr::list_rbind()
+    }) |>
+    purrr::list_rbind()
+
+  purrr::imap(records, \(r, i) {
+    c(
+      r,
+      list(
+        odd = if (is.null(findings)) {
+          character(0)
+        } else {
+          findings$text[findings$i == i]
+        }
+      )
+    )
+  })
 }
 
 # Every capture under a folder, with what has and has not been logged for each.
@@ -376,6 +476,13 @@ scan_inventory <- function(root) {
       is_wr = wr_session_name(name),
       wr_session = wr[["names"]],
       wr_rule = wr[["rule"]],
+      # The white-reference session's own integration time — the value a
+      # poisoned reference betrays itself by (30 ms among 3 ms ones).
+      wr_et = if (is.null(wr[["white_hdr"]])) {
+        NA_real_
+      } else {
+        parse_hdr(wr[["white_hdr"]])[["tint"]]
+      },
       sidecar = if (file.exists(sidecar)) sidecar else NULL
     )
   })
@@ -401,7 +508,7 @@ scan_inventory <- function(root) {
     paste(date, if (is.na(time)) "" else time)
   })
 
-  records[order(undated, keys)]
+  flag_odd(records[order(undated, keys)])
 }
 
 # terra refuses an ENVI .hdr path outright ("the data file should be selected
@@ -1781,8 +1888,8 @@ server <- function(input, output, session) {
     # The field follows the log, including when there is no log to follow. The
     # count is only written under the condition that produced it, so leaving the
     # previous capture's number sitting in the field is how a sidecar ends up
-    # recording another scan's dropped frames — the quiet failure the log search
-    # was rewritten this morning to avoid.
+    # recording another scan's dropped frames — the quiet failure
+    # discover_capture()'s log search exists to avoid.
     shiny::updateNumericInput(
       session,
       "dropped_frames",
@@ -2793,7 +2900,19 @@ server <- function(input, output, session) {
             if (r[["is_wr"]]) {
               shiny::span(class = "ms-1", "· white-reference session")
             }
-          )
+          ),
+          # A setting that should hold for the whole session but does not
+          # here. Caution, not fault: the operator may have meant it.
+          if (length(r[["odd"]]) > 0) {
+            shiny::div(
+              class = "small text-warning",
+              bsicons::bs_icon("exclamation-triangle"),
+              paste0(
+                " differs from its session: ",
+                paste(r[["odd"]], collapse = "; ")
+              )
+            )
+          }
         ),
         shiny::tags$td(num(h[["camera"]])),
         shiny::tags$td(
@@ -2808,6 +2927,13 @@ server <- function(input, output, session) {
         shiny::tags$td(
           class = "small",
           if (is.na(h[["tint"]])) "—" else paste(round(h[["tint"]], 2), "ms")
+        ),
+        shiny::tags$td(
+          class = paste(
+            "small",
+            if (any(startsWith(r[["odd"]], "WR ET"))) "text-warning fw-bold"
+          ),
+          if (is.na(r[["wr_et"]])) "—" else paste(round(r[["wr_et"]], 2), "ms")
         ),
         shiny::tags$td(
           class = "small text-nowrap",
@@ -2892,6 +3018,7 @@ server <- function(input, output, session) {
         shiny::tags$th("Sensor"),
         shiny::tags$th("Lines × samples × bands"),
         shiny::tags$th("ET"),
+        shiny::tags$th("WR ET"),
         shiny::tags$th("References"),
         shiny::tags$th("WR session"),
         shiny::tags$th("Sidecar"),

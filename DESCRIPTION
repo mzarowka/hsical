@@ -1,6 +1,6 @@
 Package: hsical
 Title: Hyperspectral Image Calibration Tool
-Version: 2.2.0.9001
+Version: 2.2.1
 Authors@R: c(
     person("Maurycy", "Żarczyński", , email = "maurycy.zarczynski@ug.edu.pl", role = c("aut", "cre")),
     person("Claude", role = "ctb", comment = "Anthropic; two-mode v2.0 rebuild, single-scan v2.1"))
@@ -12,7 +12,10 @@ Description: A Shiny companion for hyperspectral scanning sessions. It treats
     aspect ratio, and the field of view that would square the pixels. Those
     derived values, together with operator input and header values, are written
     to an HSItools metadata sidecar, with a Review panel to read sidecars back
-    and correct them in place.
+    and correct them in place. Dropped frames are flagged at load. A Saturation
+    panel screens a capture's raw digital numbers for clipping and maps where it
+    clips, for display only; an Inventory panel lists every capture under a
+    folder with its references, white-reference session and sidecar status.
     HSIcal owns no schema of its own; sidecar structure, serialization, and
     validation belong to HSItools.
 License: MIT + file LICENSE
