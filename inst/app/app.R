@@ -142,8 +142,9 @@ parse_hdr <- function(hdr_path) {
 
 # Parse Lumo .log file
 parse_log <- function(log_path) {
+  none <- data.frame(frame = numeric(0), count = numeric(0))
   if (!file.exists(log_path)) {
-    return(list(dropped = NA_real_, recorded = NA_real_))
+    return(list(dropped = NA_real_, recorded = NA_real_, incidents = none))
   }
 
   content <- readLines(log_path, warn = FALSE) |> paste(collapse = "\n")
@@ -157,10 +158,83 @@ parse_log <- function(log_path) {
     regexpr("[0-9]+(?= frames recorded)", content, perl = TRUE)
   )
 
+  # One line per incident after the summary, "<frame> <count>": where in the
+  # scan each gap opened and how many frames it swallowed. The frame is the
+  # recorded line the gap follows, which is what a depth correction needs.
+  rows <- regmatches(
+    content,
+    gregexpr("(?m)^[ \t]*[0-9]+[ \t]+[0-9]+[ \t]*$", content, perl = TRUE)
+  )[[1]]
+  incidents <- if (length(rows) == 0) {
+    none
+  } else {
+    parts <- strsplit(trimws(rows), "[ \t]+")
+    data.frame(
+      frame = purrr::map_dbl(parts, \(p) as.numeric(p[[1]])),
+      count = purrr::map_dbl(parts, \(p) as.numeric(p[[2]]))
+    )
+  }
+
   list(
     dropped = if (length(dropped) == 0) NA_real_ else as.numeric(dropped),
-    recorded = if (length(recorded) == 0) NA_real_ else as.numeric(recorded)
+    recorded = if (length(recorded) == 0) NA_real_ else as.numeric(recorded),
+    incidents = incidents[order(incidents$frame), , drop = FALSE]
   )
+}
+
+# Did the stage keep moving while frames were dropped? The raster holds only the
+# recorded lines, so if it did, the scan covers recorded + dropped steps of
+# travel and the pixel size is length / (recorded + dropped); if it waited, the
+# recorded count is right. The capture's own clock tells the two apart: Start
+# and Stop Time either span the lost frames or they do not.
+#
+# Measured on 474 archive captures (2026-09-15): clean captures' duration sits
+# within ±0.8 s of recorded / fps (5–95 %); every VNIR drop case matched
+# (recorded + dropped) / fps within ±1 s; SWIR on Lumo v2025-96 matched
+# recorded / fps only — either the stage waits or that clock is computed from
+# the frames, so that case is reported, not corrected. A gap shorter than twice
+# the tolerance cannot be told apart from clock scatter.
+#
+# Returns NULL when nothing was dropped, else list(verdict, drop_s), verdict one
+# of "moved", "clock_excludes", "too_short", "no_times".
+clock_gap <- function(hdr, lg) {
+  if (is.null(lg) || is.na(lg[["dropped"]]) || lg[["dropped"]] == 0) {
+    return(NULL)
+  }
+
+  fps <- hdr[["fps"]]
+  recorded <- lg[["recorded"]]
+  dropped <- lg[["dropped"]]
+  secs <- \(t) {
+    p <- as.numeric(strsplit(t, ":", fixed = TRUE)[[1]])
+    if (length(p) != 3 || anyNA(p)) NA_real_ else sum(p * c(3600, 60, 1))
+  }
+  start <- if (is.na(hdr[["start_time"]])) {
+    NA_real_
+  } else {
+    secs(hdr[["start_time"]])
+  }
+  stop <- if (is.na(hdr[["stop_time"]])) NA_real_ else secs(hdr[["stop_time"]])
+
+  if (anyNA(c(fps, recorded, start, stop)) || fps <= 0) {
+    return(list(verdict = "no_times", drop_s = NA_real_))
+  }
+
+  drop_s <- dropped / fps
+  # A scan that runs past midnight UTC wraps the clock.
+  duration <- (stop - start) %% 86400
+
+  verdict <- if (drop_s < 2 * CLOCK_TOLERANCE_S) {
+    "too_short"
+  } else if (abs(duration - (recorded + dropped) / fps) <= CLOCK_TOLERANCE_S) {
+    "moved"
+  } else if (abs(duration - recorded / fps) <= CLOCK_TOLERANCE_S) {
+    "clock_excludes"
+  } else {
+    "no_times"
+  }
+
+  list(verdict = verdict, drop_s = drop_s)
 }
 
 # First file in `dir` matching `pattern`, or NULL. Case-insensitive.
@@ -411,6 +485,10 @@ wr_session_name <- function(x) grepl(WR_SESSION_MARK, x, ignore.case = TRUE)
 fmt_count <- function(n) {
   format(n, big.mark = " ", scientific = FALSE, trim = TRUE)
 }
+
+# How closely a capture's Start/Stop duration must match a frame count to count as
+# evidence (clock_gap()). Clean archive captures scatter within ±0.8 s.
+CLOCK_TOLERANCE_S <- 1
 
 # The cold reminders, shown on the Scan panel while no capture is loaded.
 #
@@ -1540,6 +1618,11 @@ server <- function(input, output, session) {
     }
 
     # Along-track: fixed by the motors and the frame rate. FOV cannot change it.
+    # Always length / nrow, dropped frames or not, so the sidecar's yres means one
+    # thing on every capture. A capture that dropped frames is rescanned (lab
+    # rule, 2026-09-24); the discovery list says what the drop did to the
+    # geometry, as information only, and processing corrects archive scans from
+    # the log.
     yres <- if (!is.na(length_mm) && !is.null(lines) && lines > 0) {
       length_mm * 1000 / lines
     } else {
@@ -1656,56 +1739,44 @@ server <- function(input, output, session) {
     }
 
     refresh_lens(sensor, hdr[["lens"]], keep_mismatch = TRUE)
-    if (!is.na(hdr[["lines"]])) {
-      shiny::updateNumericInput(session, "nrow", value = hdr[["lines"]])
-    }
-    if (!is.na(hdr[["samples"]])) {
-      shiny::updateNumericInput(session, "ncol", value = hdr[["samples"]])
-    }
-    if (!is.na(hdr[["bands"]])) {
-      shiny::updateNumericInput(session, "nlyr", value = hdr[["bands"]])
-    }
-    if (!is.na(hdr[["tint"]])) {
+
+    # Every field below describes this capture's raster, so each follows the
+    # header in both directions: a value present is written, a value absent is
+    # cleared. Writing only when present left the previous capture's number in
+    # place whenever a header lacked one — a Lumo header never does, but any
+    # other vendor's or a hand-edited one can — and the next save recorded the
+    # other scan's value without a word. Loading a capture means describing it.
+    set_num <- \(id, value) {
       shiny::updateNumericInput(
         session,
-        "et_target_ms",
-        value = round(hdr[["tint"]], 3)
+        id,
+        value = if (is.null(value) || is.na(value)) NA else value
       )
     }
-    if (!is.na(hdr[["fps"]])) {
-      shiny::updateNumericInput(session, "frame_rate_hz", value = hdr[["fps"]])
-    }
-    if (!is.na(hdr[["spectral_binning"]])) {
-      shiny::updateNumericInput(
-        session,
-        "spectral_binning",
-        value = hdr[["spectral_binning"]]
-      )
-    }
-    if (!is.na(hdr[["spatial_binning"]])) {
-      shiny::updateNumericInput(
-        session,
-        "spatial_binning",
-        value = hdr[["spatial_binning"]]
-      )
-    }
+
+    set_num("nrow", hdr[["lines"]])
+    set_num("ncol", hdr[["samples"]])
+    set_num("nlyr", hdr[["bands"]])
+    set_num("et_target_ms", round(hdr[["tint"]], 3))
+    set_num("frame_rate_hz", hdr[["fps"]])
+    set_num("spectral_binning", hdr[["spectral_binning"]])
+    set_num("spatial_binning", hdr[["spatial_binning"]])
 
     spectral(list(wavelengths = hdr[["wavelengths"]], fwhm = hdr[["fwhm"]]))
 
-    # White reference: only its integration time matters to the sidecar.
-    if (!is.null(cap$white)) {
-      white <- parse_hdr(cap$white)
-      if (!is.null(white) && !is.na(white[["tint"]])) {
-        shiny::updateNumericInput(
-          session,
-          "et_white_ms",
-          value = round(white[["tint"]], 3)
-        )
-      }
-    }
+    # White reference: only its integration time matters to the sidecar, and it
+    # is this capture's — so no WHITEREF sibling, or one without a tint, clears
+    # the field rather than keeping the last capture's.
+    white <- if (is.null(cap$white)) NULL else parse_hdr(cap$white)
+    set_num(
+      "et_white_ms",
+      if (is.null(white)) NA else round(white[["tint"]], 3)
+    )
 
     lg <- if (is.null(cap$log)) NULL else parse_log(cap$log)
-    frames(lg)
+    # The clock verdict travels with the log reading, since both describe the
+    # same drops and are read together by the geometry and the discovery list.
+    frames(if (is.null(lg)) NULL else c(lg, list(clock = clock_gap(hdr, lg))))
 
     # The field follows the log, including when there is no log to follow. The
     # count is only written under the condition that produced it, so leaving the
@@ -1861,21 +1932,137 @@ server <- function(input, output, session) {
         ))
       }
 
-      shiny::div(
-        class = "text-danger fw-bold mt-1",
-        bsicons::bs_icon("exclamation-triangle"),
-        " ",
-        paste(
-          fmt_count(n),
-          if (n == 1) "dropped frame" else "dropped frames"
+      shiny::tagList(
+        shiny::div(
+          class = "text-danger fw-bold mt-1",
+          bsicons::bs_icon("exclamation-triangle"),
+          " ",
+          paste(
+            fmt_count(n),
+            if (n == 1) "dropped frame" else "dropped frames"
+          ),
+          if (!is.na(recorded) && recorded > 0) {
+            sprintf(
+              " of %s recorded (%.2f%%)",
+              fmt_count(recorded),
+              100 * n / recorded
+            )
+          }
         ),
-        if (!is.na(recorded) && recorded > 0) {
+        gap_note(lg)
+      )
+    }
+
+    # What the drop did to the geometry, from the capture's own clock. Where the
+    # stage provably kept moving, the pixel size is already corrected and what is
+    # left to say is where the gaps sit — everything below one lies deeper than
+    # its line index. Where the clock cannot tell, both pixel sizes are given and
+    # nothing is corrected.
+    gap_note <- function(lg) {
+      clock <- lg[["clock"]]
+      if (is.null(clock)) {
+        return(NULL)
+      }
+      n <- lg[["dropped"]]
+      recorded <- lg[["recorded"]]
+      g <- geom()
+      um <- \(v) if (is.na(v)) "—" else sprintf("%.2f µm", v)
+      inc <- lg[["incidents"]]
+      # The pixel size a moving stage gives: what the gaps are measured in,
+      # whether the movement is proven or only a possibility.
+      yres_moved <- g$yres * recorded / (recorded + n)
+
+      # certain = FALSE when the clock cannot tell. The gaps are then only what
+      # a moving stage would have left, so they are worded as a condition —
+      # if the stage waited, nothing is missing.
+      where <- \(certain) {
+        if (nrow(inc) == 0) {
+          return(NULL)
+        }
+        # Each gap in its own words: after which recorded line, how many lines,
+        # and — once the scan length is known — how far that shifts everything
+        # below it.
+        gaps <- purrr::map_chr(seq_len(nrow(inc)), \(i) {
+          shift <- if (is.na(yres_moved)) {
+            ""
+          } else {
+            sprintf(", %.1f mm", inc$count[[i]] * yres_moved / 1000)
+          }
           sprintf(
-            " of %s recorded (%.2f%%)",
-            fmt_count(recorded),
-            100 * n / recorded
+            "%s after line %s%s",
+            fmt_count(inc$count[[i]]),
+            fmt_count(inc$frame[[i]]),
+            shift
+          )
+        })
+        # A bad capture can hold hundreds of incidents (222 on one archive
+        # scan); the first few say where the damage starts, and the log has the
+        # rest.
+        shown <- utils::head(gaps, 3)
+        rest <- length(gaps) - length(shown)
+        listed <- paste0(
+          paste(shown, collapse = "; "),
+          if (rest > 0) {
+            sprintf(
+              "; and %s more gaps (%s lines) listed in the log",
+              fmt_count(rest),
+              fmt_count(sum(inc$count[-seq_along(shown)]))
+            )
+          }
+        )
+        if (certain) {
+          paste0(
+            " Missing lines: ",
+            listed,
+            ". Everything below a gap lies deeper than its line index says."
+          )
+        } else {
+          paste0(
+            " If it did keep moving, lines are missing (",
+            listed,
+            ") and everything below a gap lies deeper than its line index says."
           )
         }
+      }
+
+      text <- switch(
+        clock[["verdict"]],
+        moved = paste0(
+          "The scan clock includes the gap, so the stage kept moving: the true",
+          " pixel size is ",
+          um(yres_moved),
+          ", not the ",
+          um(g$yres),
+          " that length ÷ recorded lines gives.",
+          where(TRUE)
+        ),
+        clock_excludes = paste0(
+          "The scan clock covers the recorded frames only, so hsical cannot tell",
+          " whether the stage waited: the pixel size is ",
+          um(g$yres),
+          " if it did, ",
+          um(yres_moved),
+          " if it kept moving.",
+          where(FALSE)
+        ),
+        too_short = sprintf(
+          "The gap is %.1f s, too short for the scan clock to show whether the stage kept moving; either way the pixel size changes by %.2f%%.",
+          clock[["drop_s"]],
+          100 * n / recorded
+        ),
+        no_times = paste0(
+          "The header gives no usable scan times, so hsical cannot tell whether",
+          " the stage kept moving.",
+          where(FALSE)
+        )
+      )
+
+      # Information only: yres in the sidecar stays length / nrow on every
+      # capture, and the remedy is a new scan, not a corrected number.
+      shiny::div(
+        class = "small text-body mt-1",
+        text,
+        shiny::strong(" Rescan to get a clean capture.")
       )
     }
 
